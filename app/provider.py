@@ -31,6 +31,14 @@ ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
 ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups')
+# Optional base path (when the app is mounted at a subpath behind a reverse proxy)
+BASE_PATH = os.getenv('BASE_PATH', '')
+if BASE_PATH:
+    # normalize: ensure leading slash, no trailing slash (unless root)
+    if not BASE_PATH.startswith('/'):
+        BASE_PATH = '/' + BASE_PATH
+    if BASE_PATH.endswith('/') and BASE_PATH != '/':
+        BASE_PATH = BASE_PATH.rstrip('/')
 
 # Store authorization codes temporarily (in production, use Redis or similar)
 AUTH_CODES = {}
@@ -75,12 +83,26 @@ class OIDCHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else 'unknown'
         logger.info(f"GET {parsed_path.path} from {client_ip}")
 
-        # Serve static files from /static/*
-        if parsed_path.path.startswith('/static/'):
+        # Support optional BASE_PATH prefix (strip it for routing)
+        orig_path = parsed_path.path
+        if BASE_PATH and orig_path.startswith(BASE_PATH):
+            routed_path = orig_path[len(BASE_PATH):] or '/'
+            # build a new parsed_path-like object for routing convenience
+            parsed_path = parsed_path._replace(path=routed_path)
+        else:
+            routed_path = orig_path
+
+        # Serve static files from /static/* (also handle when mounted under BASE_PATH)
+        static_prefix = f"{BASE_PATH}/static" if BASE_PATH else '/static'
+        if orig_path.startswith(static_prefix):
             try:
                 # Static files live in project_root/static
                 static_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-                file_path = os.path.join(static_root, parsed_path.path.lstrip('/'))
+                # compute file path using orig_path (so prefix is stripped)
+                rel = orig_path[len(static_prefix):]
+                if rel.startswith('/'):
+                    rel = rel[1:]
+                file_path = os.path.join(static_root, 'static', rel)
                 if os.path.isfile(file_path):
                     with open(file_path, 'rb') as fh:
                         self.send_response(200)
@@ -95,6 +117,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+        # Route using the (possibly stripped) parsed_path
         if parsed_path.path == '/.well-known/openid-configuration':
             self.send_discovery_document()
         elif parsed_path.path == '/authorize':
@@ -105,8 +128,16 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_jwks()
         elif parsed_path.path.startswith('/test-token/'):
             # pass the full request path (including query string) so send_test_token
-            # can parse query params correctly
-            self.send_test_token(self.path)
+            # can parse query params correctly; translate path to routed form
+            # rebuild a path that includes query but uses the routed path
+            # orig_self_path contains original request (possibly with BASE_PATH)
+            orig_self_path = self.path
+            # if BASE_PATH is set, remove it from the original path before passing
+            if BASE_PATH and orig_self_path.startswith(BASE_PATH):
+                trimmed = orig_self_path[len(BASE_PATH):]
+            else:
+                trimmed = orig_self_path
+            self.send_test_token(trimmed)
         else:
             logger.warning(f"404 Not Found: {parsed_path.path} from {client_ip}")
             self.send_response(404)
@@ -119,6 +150,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
         parsed_path = urlparse(self.path)
         client_ip = self.client_address[0] if self.client_address else 'unknown'
         logger.info(f"POST {parsed_path.path} from {client_ip}")
+        # strip BASE_PATH for routing if present
+        orig_path = parsed_path.path
+        if BASE_PATH and orig_path.startswith(BASE_PATH):
+            routed_path = orig_path[len(BASE_PATH):] or '/'
+            parsed_path = parsed_path._replace(path=routed_path)
 
         if parsed_path.path == '/token':
             self.send_token()
@@ -162,15 +198,17 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 state=state,
                 response_type=response_type,
                 code_challenge=code_challenge,
+                base_path=BASE_PATH,
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(html.encode())
             return
-        except Exception:
-            # Fallback to minimal inline form if templates aren't available
-            html = f"<html><body><form method=\"POST\" action=\"/authorize\"><input name=\"client_id\" value=\"{client_id}\"/></form></body></html>"
+        except Exception as e:
+            # Log the exception to aid debugging, then fallback to minimal inline form
+            logger.exception("Failed to render 'authorize.html' template")
+            html = f"<html><body><form method=\"POST\" action=\"{BASE_PATH + '/authorize' if BASE_PATH else '/authorize'}\"><input name=\"client_id\" value=\"{client_id}\"/></form></body></html>"
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
@@ -229,7 +267,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             # Render error template if available
             try:
                 template = TEMPLATES.get_template('error.html')
-                html = template.render()
+                html = template.render(base_path=BASE_PATH)
                 self.send_response(401)
                 self.send_header('Content-Type', 'text/html')
                 self.end_headers()

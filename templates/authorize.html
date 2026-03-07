@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Sign In - OIDC Provider</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="{{ base_path }}/static/styles.css">
 </head>
 <body>
   <div class="login-container">
     <h1>🔐 Sign In</h1>
     <p class="subtitle">OIDC Test Provider</p>
-    <form method="POST" action="/authorize">
+    <form method="POST" action="{{ base_path }}/authorize">
       <input type="hidden" name="client_id" value="{{ client_id }}">
       <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
       <input type="hidden" name="state" value="{{ state }}">
