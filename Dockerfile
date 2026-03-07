@@ -8,7 +8,11 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Copy requirements early so pip can install them during image build
+COPY requirements.txt ./
+
 RUN pip install --no-cache-dir -r requirements.txt
+
 # Copy the provider script
 COPY app/provider.py .
 
