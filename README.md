@@ -1,6 +1,6 @@
 # mock-oidc — Mock OIDC Provider (development)
 
-![CI](https://github.com/HarryKodden/mock-oidc/actions/workflows/docker-publish.yml/badge.svg)
+![CI](https://github.com/HarryKodden/mock-oidc/actions/workflows/release.yml/badge.svg?branch=main) ![Release](https://img.shields.io/github/v/release/HarryKodden/mock-oidc?label=release) ![GHCR](https://img.shields.io/docker/v/ghcr.io/harrykodden/mock-oidc/latest?label=ghcr%20image)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
 
 A tiny, standalone OpenID Connect (OIDC) test provider useful for local development and integration tests where you need an OIDC issuer to validate tokens or exercise OAuth/OIDC flows.
@@ -13,7 +13,7 @@ Features
 - /test-token/{user} quick token generator for tests
 
 Status
-- CI builds a Docker image and pushes it to GitHub Container Registry (GHCR) on `main` (workflow: `.github/workflows/docker-publish.yml`). The workflow runs tests before building.
+- CI builds a Docker image and pushes it to GitHub Container Registry (GHCR) on `main` (workflow: `.github/workflows/release.yml`). The workflow runs tests before building.
 
 Quick start (local)
 
