@@ -1,0 +1,22 @@
+services:
+  # OIDC Provider - For testing authentication without external OIDC
+  oidc:
+    build: .
+    expose:
+      - "8888"
+    # Use bridge networking so services can reach each other by service name.
+    ports:
+      - "8888:8888"
+    environment:
+      - ISSUER=http://localhost:8888
+      - CLIENT_ID=test-client
+      - CLIENT_SECRET=test-secret
+      - ROLES_CLAIM=Groups
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/.well-known/openid-configuration"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
