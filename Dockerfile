@@ -13,11 +13,11 @@ COPY requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the provider script
-COPY app/provider.py .
+# Copy the application package
+COPY app/ ./app
 
 # Expose port 8888
 EXPOSE 8888
 
-# Run the server
-CMD ["python", "provider.py"]
+# Run the server as module
+CMD ["python", "-m", "app.provider"]
