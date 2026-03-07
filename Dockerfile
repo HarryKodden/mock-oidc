@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application package
 COPY app/ ./app
+# Copy templates and static assets so Jinja2 can load templates at runtime
+COPY templates/ ./templates
+COPY static/ ./static
 
 # Expose port 8888
 EXPOSE 8888
