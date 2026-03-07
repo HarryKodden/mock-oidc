@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign In - OIDC Provider</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="login-container">
+    <h1>🔐 Sign In</h1>
+    <p class="subtitle">OIDC Test Provider</p>
+    <form method="POST" action="/authorize">
+      <input type="hidden" name="client_id" value="{{ client_id }}">
+      <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
+      <input type="hidden" name="state" value="{{ state }}">
+      <input type="hidden" name="response_type" value="{{ response_type }}">
+      <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
+      <div class="form-group">
+        <label for="username">Username / Email</label>
+        <input type="text" id="username" name="username" required autofocus>
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" placeholder="(any value accepted)">
+      </div>
+      <div class="form-group">
+        <label for="roles">Groups</label>
+        <input type="text" id="roles" name="roles" placeholder="e.g., admin-group,developer-group">
+      </div>
+      <button type="submit">Sign In</button>
+    </form>
+    <div class="info-box">
+      <strong>Test Provider:</strong><br>
+      Enter any username and roles.<br>
+      Password is ignored.
+    </div>
+  </div>
+</body>
+</html>

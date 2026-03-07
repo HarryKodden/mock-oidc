@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +36,13 @@ ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups')
 AUTH_CODES = {}
 # Store access token data (username, roles) for /userinfo endpoint
 TOKEN_DATA = {}
+
+# Jinja2 templates environment
+_TEMPLATE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
+TEMPLATES = Environment(
+    loader=FileSystemLoader(_TEMPLATE_DIR),
+    autoescape=select_autoescape(['html', 'xml'])
+)
 
 class OIDCHandler(BaseHTTPRequestHandler):
     """OIDC provider HTTP handler"""
@@ -66,6 +74,26 @@ class OIDCHandler(BaseHTTPRequestHandler):
         parsed_path = urlparse(self.path)
         client_ip = self.client_address[0] if self.client_address else 'unknown'
         logger.info(f"GET {parsed_path.path} from {client_ip}")
+
+        # Serve static files from /static/*
+        if parsed_path.path.startswith('/static/'):
+            try:
+                # Static files live in project_root/static
+                static_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+                file_path = os.path.join(static_root, parsed_path.path.lstrip('/'))
+                if os.path.isfile(file_path):
+                    with open(file_path, 'rb') as fh:
+                        self.send_response(200)
+                        # Minimal content-type guessing
+                        if file_path.endswith('.css'):
+                            self.send_header('Content-Type', 'text/css')
+                        else:
+                            self.send_header('Content-Type', 'application/octet-stream')
+                        self.end_headers()
+                        self.wfile.write(fh.read())
+                        return
+            except Exception:
+                pass
 
         if parsed_path.path == '/.well-known/openid-configuration':
             self.send_discovery_document()
@@ -125,142 +153,28 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid_request"}).encode())
             return
         
-        # Show HTML login form
-        html = f'''
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Sign In - OIDC Provider</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }}
-        .login-container {{
-            background: white;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            max-width: 400px;
-            width: 100%;
-        }}
-        h1 {{
-            color: #333;
-            font-size: 28px;
-            margin-bottom: 10px;
-            text-align: center;
-        }}
-        .subtitle {{
-            color: #666;
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 14px;
-        }}
-        .form-group {{
-            margin-bottom: 20px;
-        }}
-        label {{
-            display: block;
-            margin-bottom: 8px;
-            color: #333;
-            font-weight: 500;
-            font-size: 14px;
-        }}
-        input[type="text"],
-        input[type="password"] {{
-            width: 100%;
-            padding: 12px 16px;
-            border: 2px solid #e1e4e8;
-            border-radius: 6px;
-            font-size: 14px;
-            transition: border-color 0.3s;
-        }}
-        input[type="text"]:focus,
-        input[type="password"]:focus {{
-            outline: none;
-            border-color: #667eea;
-        }}
-        button {{
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }}
-        button:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
-        }}
-        button:active {{
-            transform: translateY(0);
-        }}
-        .info-box {{
-            background: #f6f8fa;
-            padding: 15px;
-            border-radius: 6px;
-            margin-top: 20px;
-            font-size: 12px;
-            color: #666;
-        }}
-        .info-box strong {{
-            color: #333;
-        }}
-    </style>
-</head>
-<body>
-    <div class="login-container">
-        <h1>🔐 Sign In</h1>
-        <p class="subtitle">OIDC Test Provider</p>
-        <form method="POST" action="/authorize">
-            <input type="hidden" name="client_id" value="{client_id}">
-            <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-            <input type="hidden" name="state" value="{state}">
-            <input type="hidden" name="response_type" value="{response_type}">
-            <input type="hidden" name="code_challenge" value="{code_challenge}">
-            <div class="form-group">
-                <label for="username">Username / Email</label>
-                <input type="text" id="username" name="username" required autofocus>
-            </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" placeholder="(any value accepted)">
-            </div>
-            <div class="form-group">
-                <label for="roles">Groups (comma-separated SCIM group IDs)</label>
-                <input type="text" id="roles" name="roles" placeholder="e.g., admin-group,developer-group">
-            </div>
-            <button type="submit">Sign In</button>
-        </form>
-        <div class="info-box">
-            <strong>Test Provider:</strong><br>
-            Enter any username and roles.<br>
-            Password is ignored.
-        </div>
-    </div>
-</body>
-</html>
-        '''
-        
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-        self.wfile.write(html.encode())
+        # Render authorize template
+        try:
+            template = TEMPLATES.get_template('authorize.html')
+            html = template.render(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                state=state,
+                response_type=response_type,
+                code_challenge=code_challenge,
+            )
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(html.encode())
+            return
+        except Exception:
+            # Fallback to minimal inline form if templates aren't available
+            html = f"<html><body><form method=\"POST\" action=\"/authorize\"><input name=\"client_id\" value=\"{client_id}\"/></form></body></html>"
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(html.encode())
     
     def handle_authorize_post(self):
         """Handle login form submission"""
@@ -312,57 +226,21 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             logger.warning(f"Login failed from {client_ip} - username is required")
-            # Invalid credentials - show error
-            html = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Sign In Failed - OIDC Provider</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .error-container {
-            background: white;
-            padding: 40px;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            max-width: 400px;
-            text-align: center;
-        }
-        h1 { color: #e53e3e; margin-bottom: 15px; }
-        p { color: #666; margin-bottom: 20px; }
-        a {
-            display: inline-block;
-            padding: 12px 24px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 6px;
-            font-weight: 600;
-        }
-        a:hover { background: #5568d3; }
-    </style>
-</head>
-<body>
-    <div class="error-container">
-        <h1>❌ Authentication Failed</h1>
-        <p>Username is required.</p>
-        <a href="javascript:history.back()">Try Again</a>
-    </div>
-</body>
-</html>
-            '''
-            self.send_response(401)
-            self.send_header('Content-Type', 'text/html')
-            self.end_headers()
-            self.wfile.write(html.encode())
+            # Render error template if available
+            try:
+                template = TEMPLATES.get_template('error.html')
+                html = template.render()
+                self.send_response(401)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(html.encode())
+                return
+            except Exception:
+                self.send_response(401)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "username_required"}).encode())
+                return
     
     def send_discovery_document(self):
         """Send OpenID Connect discovery document"""
