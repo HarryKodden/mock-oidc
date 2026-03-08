@@ -7,6 +7,7 @@ The gateway can then validate tokens against this server.
 """
 
 import json
+import uuid
 import jwt
 import os
 import sys
@@ -189,7 +190,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid_request"}).encode())
             return
         
-        # Try to prefill userinfo from cookie if present
+        # Try to prefill userinfo from cookie if present; otherwise generate defaults
         saved_userinfo = None
         cookie_header = self.headers.get('Cookie', '')
         if cookie_header:
@@ -198,10 +199,27 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 kv = part.strip()
                 if kv.startswith('mock_oidc_userinfo='):
                     try:
-                        saved_userinfo = unquote(kv.split('=', 1)[1])
+                        cookie_val = unquote(kv.split('=', 1)[1])
+                        # try to parse JSON cookie into an object
+                        try:
+                            parsed = json.loads(cookie_val)
+                            if isinstance(parsed, dict):
+                                saved_userinfo = parsed
+                            else:
+                                saved_userinfo = None
+                        except Exception:
+                            saved_userinfo = None
                     except Exception:
                         saved_userinfo = None
                     break
+
+        # If no saved userinfo, create sensible defaults with a generated sub UUID
+        if not saved_userinfo:
+            saved_userinfo = {
+                'sub': str(uuid.uuid4()),
+                'email': 'user@example.com',
+                'groups': ['developer']
+            }
 
         # Render authorize template
         try:

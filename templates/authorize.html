@@ -73,9 +73,14 @@
 
       function renderRows(obj){
         container.innerHTML = '';
-        Object.keys(obj || {}).forEach(function(key){
-          addRow(key, toDisplayValue(obj[key]));
-        });
+          const keys = Object.keys(obj || {});
+          const ordered = [];
+          // ensure sub first, email second
+          if (keys.includes('sub')) ordered.push('sub');
+          if (keys.includes('email')) ordered.push('email');
+          keys.forEach(function(k){ if (k !== 'sub' && k !== 'email') ordered.push(k); });
+          ordered.forEach(function(key){ addRow(key, toDisplayValue(obj[key])); });
+          validateAllKeys();
       }
 
       function addRow(key='', value=''){
@@ -86,6 +91,13 @@
         row.style.gridTemplateColumns = '140px 1fr 40px';
         row.style.gridColumnGap = '8px';
         row.style.alignItems = 'center';
+          // inline error indicator for duplicate key
+          const err = document.createElement('div');
+          err.style.color = '#ef4444';
+          err.style.fontSize = '12px';
+          err.style.marginTop = '4px';
+          err.style.gridColumn = '1 / span 3';
+          err.style.display = 'none';
 
         const k = document.createElement('input');
         k.type = 'text'; k.placeholder = 'claim name (e.g. sub)'; k.value = key; k.style.width = '100%'; k.style.boxSizing = 'border-box';
@@ -122,20 +134,91 @@
         rem.style.border = '1px solid transparent';
         rem.style.borderRadius = '4px';
         rem.style.cursor = 'pointer';
-        rem.addEventListener('mouseenter', function(){ rem.style.background = 'rgba(239,68,68,0.08)'; });
-        rem.addEventListener('mouseleave', function(){ rem.style.background = 'transparent'; });
-        rem.addEventListener('click', function(){ container.removeChild(row); });
+        // protect `sub` and `email` from being renamed or removed
+        if (key === 'sub' || key === 'email') {
+          k.readOnly = true;
+          k.style.opacity = '0.9';
+          // hide remove control for these keys
+          rem.style.visibility = 'hidden';
+          rem.disabled = true;
+        } else {
+          // validate uniqueness when user edits key
+          k.addEventListener('input', function(){
+            validateAllKeys();
+          });
+          rem.addEventListener('mouseenter', function(){ rem.style.background = 'rgba(239,68,68,0.08)'; });
+          rem.addEventListener('mouseleave', function(){ rem.style.background = 'transparent'; });
+        }
+        rem.addEventListener('click', function(){ container.removeChild(row); validateAllKeys(); });
 
         row.appendChild(k);
         row.appendChild(v);
         row.appendChild(rem);
+        row.appendChild(err);
         container.appendChild(row);
+        validateAllKeys();
       }
 
       addBtn.addEventListener('click', function(){ addRow(); });
 
       // render initial claims
       renderRows(initial);
+
+      function validateAllKeys(){
+        const submitBtn = document.querySelector('button[type=submit]');
+        const rows = container.querySelectorAll('.claim-row');
+        const counts = {};
+        rows.forEach(function(row){
+          const k = (row.children[0].value || '').trim();
+          if (!k) return;
+          counts[k] = (counts[k] || 0) + 1;
+        });
+        let invalid = false;
+        rows.forEach(function(row){
+          const keyInput = row.children[0];
+          const valInput = row.children[1];
+          const errDiv = row.children[3];
+          const k = (keyInput.value || '').trim();
+          const v = (valInput.value || '').trim();
+
+          if (!k) {
+            errDiv.textContent = 'Claim name required';
+            errDiv.style.display = 'block';
+            keyInput.style.borderColor = '#ef4444';
+            invalid = true;
+            return;
+          }
+
+          if (counts[k] > 1) {
+            errDiv.textContent = 'Duplicate claim name';
+            errDiv.style.display = 'block';
+            keyInput.style.borderColor = '#ef4444';
+            invalid = true;
+            return;
+          }
+
+          if ((k === 'sub' || k === 'email') && keyInput.readOnly === false) {
+            errDiv.textContent = 'Reserved claim name';
+            errDiv.style.display = 'block';
+            keyInput.style.borderColor = '#ef4444';
+            invalid = true;
+            return;
+          }
+
+          if ((k === 'sub' || k === 'email') && (!v)) {
+            errDiv.textContent = 'Value required for ' + k;
+            errDiv.style.display = 'block';
+            valInput.style.borderColor = '#ef4444';
+            invalid = true;
+            return;
+          }
+
+          errDiv.style.display = 'none';
+          keyInput.style.borderColor = '';
+          valInput.style.borderColor = '';
+        });
+        submitBtn.disabled = invalid;
+      }
 
       form.addEventListener('submit', function(evt){
         // Build object from rows
