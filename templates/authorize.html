@@ -17,9 +17,15 @@
       <input type="hidden" name="response_type" value="{{ response_type }}">
       <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
 
+      <!-- Hidden field that will receive serialized claims JSON -->
+      <input type="hidden" id="userinfo" name="userinfo">
+
       <div class="form-group">
-        <label for="userinfo">Userinfo JSON</label>
-        <textarea id="userinfo" name="userinfo" rows="10" spellcheck="false">{{ saved_userinfo or '{"sub": "user@example.com", "email": "user@example.com", "groups": ["developer"]}' }}</textarea>
+        <label>Claims</label>
+        <div id="claimsContainer"></div>
+        <div style="margin-top:8px">
+          <button type="button" id="addClaim">+ Add claim</button>
+        </div>
       </div>
 
       <div class="form-actions">
@@ -35,21 +41,83 @@
   </div>
 
   <script>
-    // Save userinfo JSON into a cookie before submitting so next time the form is prefilled.
     (function(){
       const form = document.getElementById('authForm');
-      form.addEventListener('submit', function(){
+      const container = document.getElementById('claimsContainer');
+      const hidden = document.getElementById('userinfo');
+      const addBtn = document.getElementById('addClaim');
+
+      // Parse server-provided saved_userinfo or use default
+      let initial = null;
+      try {
+        initial = {{ saved_userinfo|tojson if saved_userinfo else 'null' }};
+      } catch (e) {
+        initial = null;
+      }
+      if (!initial) {
+        try { initial = JSON.parse('{"sub":"user@example.com","email":"user@example.com","groups":["developer"]}'); } catch(e){ initial = {} }
+      }
+
+      function toDisplayValue(v) {
+        if (Array.isArray(v) || typeof v === 'object') return JSON.stringify(v);
+        return String(v);
+      }
+
+      function renderRows(obj){
+        container.innerHTML = '';
+        Object.keys(obj || {}).forEach(function(key){
+          addRow(key, toDisplayValue(obj[key]));
+        });
+      }
+
+      function addRow(key='', value=''){
+        const row = document.createElement('div');
+        row.className = 'claim-row';
+        row.style.marginTop = '8px';
+
+        const k = document.createElement('input');
+        k.type = 'text'; k.placeholder = 'claim name (e.g. sub)'; k.value = key; k.style.width = '30%';
+
+        const v = document.createElement('input');
+        v.type = 'text'; v.placeholder = 'value (plain or JSON)'; v.value = value; v.style.width = '60%'; v.style.marginLeft='8px';
+
+        const rem = document.createElement('button');
+        rem.type = 'button'; rem.textContent = 'Remove'; rem.style.marginLeft='8px';
+        rem.addEventListener('click', function(){ container.removeChild(row); });
+
+        row.appendChild(k); row.appendChild(v); row.appendChild(rem);
+        container.appendChild(row);
+      }
+
+      addBtn.addEventListener('click', function(){ addRow(); });
+
+      // render initial claims
+      renderRows(initial);
+
+      form.addEventListener('submit', function(evt){
+        // Build object from rows
+        const out = {};
+        const rows = container.querySelectorAll('.claim-row');
+        rows.forEach(function(row){
+          const key = (row.children[0].value || '').trim();
+          let val = (row.children[1].value || '').trim();
+          if (!key) return;
+          // try JSON parse, otherwise use string
+          try { val = JSON.parse(val); }
+          catch (e) { /* keep as string */ }
+          out[key] = val;
+        });
+
+        const json = JSON.stringify(out);
+        hidden.value = json;
+
+        // save cookie for prefill on next authorize
         try {
-          const txt = document.getElementById('userinfo').value;
-          // Try parsing to ensure valid JSON
-          JSON.parse(txt);
-          // store cookie (encodeURIComponent to be safe)
-          const cookieValue = encodeURIComponent(txt);
-          // respect base path; set cookie path to base_path or '/'
+          const cookieValue = encodeURIComponent(json);
           const path = '{{ base_path or '/' }}';
           document.cookie = 'mock_oidc_userinfo=' + cookieValue + '; path=' + path + '; SameSite=Lax';
         } catch (e) {
-          // if invalid JSON, allow submit and server will return error
+          // ignore cookie errors
         }
       });
     })();
