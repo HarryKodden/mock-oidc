@@ -54,6 +54,14 @@
       } catch (e) {
         initial = null;
       }
+      // If server passed a JSON string, parse it into an object
+      if (typeof initial === 'string' && initial) {
+        try {
+          initial = JSON.parse(initial);
+        } catch (e) {
+          initial = null;
+        }
+      }
       if (!initial) {
         try { initial = JSON.parse('{"sub":"user@example.com","email":"user@example.com","groups":["developer"]}'); } catch(e){ initial = {} }
       }
@@ -74,18 +82,53 @@
         const row = document.createElement('div');
         row.className = 'claim-row';
         row.style.marginTop = '8px';
+        row.style.display = 'grid';
+        row.style.gridTemplateColumns = '140px 1fr 40px';
+        row.style.gridColumnGap = '8px';
+        row.style.alignItems = 'center';
 
         const k = document.createElement('input');
-        k.type = 'text'; k.placeholder = 'claim name (e.g. sub)'; k.value = key; k.style.width = '30%';
+        k.type = 'text'; k.placeholder = 'claim name (e.g. sub)'; k.value = key; k.style.width = '100%'; k.style.boxSizing = 'border-box';
 
         const v = document.createElement('input');
-        v.type = 'text'; v.placeholder = 'value (plain or JSON)'; v.value = value; v.style.width = '60%'; v.style.marginLeft='8px';
+        v.type = 'text'; v.placeholder = 'value (plain or JSON)'; v.value = value; v.style.width = '100%'; v.style.boxSizing = 'border-box';
 
         const rem = document.createElement('button');
-        rem.type = 'button'; rem.textContent = 'Remove'; rem.style.marginLeft='8px';
+        rem.type = 'button';
+        rem.title = 'Remove claim';
+        rem.setAttribute('aria-label', 'Remove claim');
+        rem.style.width = '28px';
+        rem.style.height = '28px';
+        rem.style.padding = '0';
+        rem.style.display = 'inline-flex';
+        rem.style.alignItems = 'center';
+        rem.style.justifyContent = 'center';
+        rem.style.background = 'transparent';
+        rem.style.border = '1px solid transparent';
+        rem.style.borderRadius = '4px';
+        rem.style.cursor = 'pointer';
+        // use a compact red cross for remove
+        rem.textContent = '✕';
+        rem.style.color = '#ef4444';
+        rem.style.fontSize = '16px';
+        rem.style.lineHeight = '16px';
+        rem.style.width = '28px';
+        rem.style.height = '28px';
+        rem.style.padding = '0';
+        rem.style.display = 'inline-flex';
+        rem.style.alignItems = 'center';
+        rem.style.justifyContent = 'center';
+        rem.style.background = 'transparent';
+        rem.style.border = '1px solid transparent';
+        rem.style.borderRadius = '4px';
+        rem.style.cursor = 'pointer';
+        rem.addEventListener('mouseenter', function(){ rem.style.background = 'rgba(239,68,68,0.08)'; });
+        rem.addEventListener('mouseleave', function(){ rem.style.background = 'transparent'; });
         rem.addEventListener('click', function(){ container.removeChild(row); });
 
-        row.appendChild(k); row.appendChild(v); row.appendChild(rem);
+        row.appendChild(k);
+        row.appendChild(v);
+        row.appendChild(rem);
         container.appendChild(row);
       }
 
