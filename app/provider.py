@@ -32,6 +32,7 @@ ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
 ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups')
+STRICT_CLIENT_AUTH = os.getenv('STRICT_CLIENT_AUTH', 'true').lower() in ('1','true','yes')
 # Optional base path (when the app is mounted at a subpath behind a reverse proxy)
 BASE_PATH = os.getenv('BASE_PATH', '')
 if BASE_PATH:
@@ -457,43 +458,59 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
             # Validate client credentials
             auth_header = self.headers.get('Authorization', '')
-
-            if not auth_header.startswith('Basic '):
-                # Check if client_id and client_secret are in form parameters
-                client_id = params.get('client_id', [''])[0]
-                client_secret = params.get('client_secret', [''])[0]
-
-                if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
-                    logger.error(f"Invalid client credentials from {client_ip} - form params")
-                    self.send_response(401)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
-                    return
-            else:
-                # Decode Basic auth
-                import base64
-                try:
-                    credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                    client_id, client_secret = credentials.split(':', 1)
+            # If STRICT_CLIENT_AUTH is enabled, validate client_id/client_secret strictly.
+            client_id = None
+            client_secret = None
+            if STRICT_CLIENT_AUTH:
+                if not auth_header.startswith('Basic '):
+                    # Check if client_id and client_secret are in form parameters
+                    client_id = params.get('client_id', [''])[0]
+                    client_secret = params.get('client_secret', [''])[0]
 
                     if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
-                        logger.error(f"Invalid client credentials from {client_ip} - basic auth")
+                        logger.error(f"Invalid client credentials from {client_ip} - form params")
                         self.send_response(401)
                         self.send_header('Content-Type', 'application/json')
                         self.send_header('Access-Control-Allow-Origin', '*')
                         self.end_headers()
                         self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
                         return
-                except Exception:
-                    logger.error(f"Failed to decode basic auth from {client_ip}")
-                    self.send_response(401)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
-                    return
+                else:
+                    # Decode Basic auth
+                    import base64
+                    try:
+                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                        client_id, client_secret = credentials.split(':', 1)
+
+                        if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
+                            logger.error(f"Invalid client credentials from {client_ip} - basic auth")
+                            self.send_response(401)
+                            self.send_header('Content-Type', 'application/json')
+                            self.send_header('Access-Control-Allow-Origin', '*')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
+                            return
+                    except Exception:
+                        logger.error(f"Failed to decode basic auth from {client_ip}")
+                        self.send_response(401)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
+                        return
+            else:
+                # permissive mode: accept any provided client_id/secret
+                if auth_header.startswith('Basic '):
+                    import base64
+                    try:
+                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                        client_id, client_secret = credentials.split(':', 1)
+                    except Exception:
+                        client_id = None
+                        client_secret = None
+                else:
+                    client_id = params.get('client_id', [''])[0]
+                    client_secret = params.get('client_secret', [''])[0]
 
             # Set user data for client credentials
             user_email = CLIENT_ID
@@ -747,6 +764,7 @@ def main():
     logger.info(f"Client ID: {CLIENT_ID}")
     logger.info(f"Client Secret: {CLIENT_SECRET}")
     logger.info(f"Roles Claim: {ROLES_CLAIM}")
+    logger.info(f"Strict client auth: {STRICT_CLIENT_AUTH}")
     logger.info("=" * 50)
     logger.info(f"Discovery: {ISSUER}/.well-known/openid-configuration")
     logger.info(f"Token: {ISSUER}/token")

@@ -86,9 +86,29 @@ Security & recommendations
 - Store authorization codes and tokens in a persistent store (Redis, DB) if you need long-lived test state.
 - Consider exposing JWKS with an actual keypair instead of an empty set if your clients validate signatures remotely.
 
+**Environment variables**
+
+The provider can be configured using environment variables. Defaults shown are the values used when the env var is not set.
+
+| Variable | Default | Description | Valid values / notes |
+|---|---|---|---|
+| `SECRET` | `test-jwt-secret-key-do-not-use-in-production` | HMAC secret used to sign JWTs (env var `SECRET`). | Any string. Use a strong secret in CI or production-like tests; rotate regularly.
+| `ISSUER` | `http://localhost:8888` | Issuer base URL (env var `ISSUER`). | Full URL including scheme and port. Update when running behind a proxy or different host.
+| `CLIENT_ID` | `test-client` | Client identifier used for strict client authentication (env var `CLIENT_ID`). | Any string. When `STRICT_CLIENT_AUTH` is enabled this must match the client's id.
+| `CLIENT_SECRET` | `test-secret` | Client secret used for strict client authentication (env var `CLIENT_SECRET`). | Any string. Keep secret in CI or secure env stores.
+| `ROLES_CLAIM` | `groups` | Name of the claim that contains role/group values in issued tokens (env var `ROLES_CLAIM`). | Any string, e.g. `groups` or `roles`. The `/userinfo` response will expose this claim name.
+| `STRICT_CLIENT_AUTH` | `true` | Toggle strict validation of client credentials (env var `STRICT_CLIENT_AUTH`). | Truthy: `1`, `true`, `yes` (case-insensitive). Set to `false` or unset to allow permissive mode (accepts any client creds) — convenient for local testing.
+| `BASE_PATH` | `` (empty) | Optional base path when the app is mounted under a reverse-proxy (env var `BASE_PATH`). | A path segment (leading slash optional). The server normalizes the value (ensures leading slash, trims trailing slash).
+
+Notes:
+- The server also sets a cookie named `mock_oidc_userinfo` when completing `/authorize` to support SSO-style prefill of the authorize UI.
+- For local Docker runs you can set these env vars with `-e NAME=value` or via a `.env` file when using `docker compose`.
+
+Recommended for CI: set `STRICT_CLIENT_AUTH=true` to exercise client authentication paths during tests.
+
 Contributing
 - Bug reports, enhancements and PRs welcome.
 
+---
 License
 - Apache License 2.0 — see `LICENSE` file.
-# mock-oidc
