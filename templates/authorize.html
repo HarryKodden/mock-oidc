@@ -9,32 +9,50 @@
 <body>
   <div class="login-container">
     <h1>🔐 Sign In</h1>
-    <p class="subtitle">OIDC Test Provider</p>
-    <form method="POST" action="{{ base_path }}/authorize">
+    <p class="subtitle">OIDC Test Provider — Compose `userinfo`</p>
+    <form method="POST" action="{{ base_path }}/authorize" id="authForm">
       <input type="hidden" name="client_id" value="{{ client_id }}">
       <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
       <input type="hidden" name="state" value="{{ state }}">
       <input type="hidden" name="response_type" value="{{ response_type }}">
       <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
+
       <div class="form-group">
-        <label for="username">Username / Email</label>
-        <input type="text" id="username" name="username" required autofocus>
+        <label for="userinfo">Userinfo JSON</label>
+        <textarea id="userinfo" name="userinfo" rows="10" spellcheck="false">{{ saved_userinfo or '{"sub": "user@example.com", "email": "user@example.com", "groups": ["developer"]}' }}</textarea>
       </div>
-      <div class="form-group">
-        <label for="password">Password</label>
-        <input type="password" id="password" name="password" placeholder="(any value accepted)">
+
+      <div class="form-actions">
+        <button type="submit">Sign In</button>
       </div>
-      <div class="form-group">
-        <label for="roles">Groups</label>
-        <input type="text" id="roles" name="roles" placeholder="e.g., admin-group,developer-group">
-      </div>
-      <button type="submit">Sign In</button>
     </form>
+
     <div class="info-box">
       <strong>Test Provider:</strong><br>
-      Enter any username and roles.<br>
-      Password is ignored.
+      Edit the JSON above to compose the claims you want returned in the token and from `/userinfo`.<br>
+      The JSON you submit is saved in a cookie for convenient re-use on subsequent authorize requests.
     </div>
   </div>
+
+  <script>
+    // Save userinfo JSON into a cookie before submitting so next time the form is prefilled.
+    (function(){
+      const form = document.getElementById('authForm');
+      form.addEventListener('submit', function(){
+        try {
+          const txt = document.getElementById('userinfo').value;
+          // Try parsing to ensure valid JSON
+          JSON.parse(txt);
+          // store cookie (encodeURIComponent to be safe)
+          const cookieValue = encodeURIComponent(txt);
+          // respect base path; set cookie path to base_path or '/'
+          const path = '{{ base_path or '/' }}';
+          document.cookie = 'mock_oidc_userinfo=' + cookieValue + '; path=' + path + '; SameSite=Lax';
+        } catch (e) {
+          // if invalid JSON, allow submit and server will return error
+        }
+      });
+    })();
+  </script>
 </body>
 </html>

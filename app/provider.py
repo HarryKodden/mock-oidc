@@ -14,7 +14,7 @@ import secrets
 import logging
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote, unquote
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 # Configure logging
@@ -189,6 +189,20 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid_request"}).encode())
             return
         
+        # Try to prefill userinfo from cookie if present
+        saved_userinfo = None
+        cookie_header = self.headers.get('Cookie', '')
+        if cookie_header:
+            # simple cookie parse
+            for part in cookie_header.split(';'):
+                kv = part.strip()
+                if kv.startswith('mock_oidc_userinfo='):
+                    try:
+                        saved_userinfo = unquote(kv.split('=', 1)[1])
+                    except Exception:
+                        saved_userinfo = None
+                    break
+
         # Render authorize template
         try:
             template = TEMPLATES.get_template('authorize.html')
@@ -199,6 +213,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 response_type=response_type,
                 code_challenge=code_challenge,
                 base_path=BASE_PATH,
+                saved_userinfo=saved_userinfo,
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
@@ -223,17 +238,42 @@ class OIDCHandler(BaseHTTPRequestHandler):
         post_data = self.rfile.read(content_length).decode('utf-8')
         post_params = parse_qs(post_data)
 
-        username = post_params.get('username', [''])[0]
-        roles_input = post_params.get('roles', ['admin'])[0]
+        # Read free-form userinfo JSON (preferred) or fall back to legacy username/roles
+        userinfo_text = post_params.get('userinfo', [''])[0]
+        username = ''
+        roles = []
+        custom_claims = {}
 
-        logger.info(f"Login attempt from {client_ip} - username: {username}, roles: {roles_input}")
+        if userinfo_text:
+            try:
+                parsed = json.loads(userinfo_text)
+                if isinstance(parsed, dict):
+                    custom_claims = parsed.copy()
+                    # extract username/email if present
+                    username = parsed.get('email') or parsed.get('sub') or ''
+                    # extract groups/roles if present
+                    groups = parsed.get('groups') or parsed.get('roles')
+                    if isinstance(groups, list):
+                        roles = groups
+                    elif isinstance(groups, str):
+                        roles = [g.strip() for g in groups.split(',') if g.strip()]
+                else:
+                    # invalid structure
+                    logger.warning(f"Invalid userinfo JSON structure from {client_ip}")
+            except Exception as e:
+                logger.warning(f"Failed to parse userinfo JSON from {client_ip}: {e}")
 
-        # Parse roles (comma-separated)
-        roles = [role.strip() for role in roles_input.split(',') if role.strip()]
-        if not roles:
-            roles = ['user']  # Default role if none specified
+        # legacy fallback: support username + roles fields for compatibility
+        if not userinfo_text:
+            username = post_params.get('username', [''])[0]
+            roles_input = post_params.get('roles', ['admin'])[0]
+            roles = [role.strip() for role in roles_input.split(',') if role.strip()]
+            if not roles:
+                roles = ['user']
 
-        # Accept any username (no password validation for testing)
+        logger.info(f"Login attempt from {client_ip} - username: {username}, roles: {roles}")
+
+        # Require at least a username/sub/email
         if username:
             # Get OAuth parameters from POST body (hidden form fields)
             client_id = post_params.get('client_id', [''])[0]
@@ -251,6 +291,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 'code_challenge': code_challenge,
                 'username': username,
                 'roles': roles,
+                'custom_claims': custom_claims,
                 'expires': datetime.now(timezone.utc) + timedelta(minutes=5)
             }
 
@@ -259,9 +300,19 @@ class OIDCHandler(BaseHTTPRequestHandler):
             # Redirect back to the application with the code
             redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
 
-            self.send_response(302)
-            self.send_header('Location', redirect_url)
-            self.end_headers()
+            # Set cookie with userinfo JSON for SSO-like prefill (encode safely)
+            try:
+                cookie_value = quote(json.dumps(custom_claims)) if custom_claims else quote(json.dumps({"sub": username, "email": username, "groups": roles}))
+                cookie_path = BASE_PATH or '/'
+                self.send_response(302)
+                self.send_header('Location', redirect_url)
+                self.send_header('Set-Cookie', f"mock_oidc_userinfo={cookie_value}; Path={cookie_path}; HttpOnly; SameSite=Lax")
+                self.end_headers()
+            except Exception:
+                # Fallback to redirect without cookie if something goes wrong
+                self.send_response(302)
+                self.send_header('Location', redirect_url)
+                self.end_headers()
         else:
             logger.warning(f"Login failed from {client_ip} - username is required")
             # Render error template if available
@@ -374,9 +425,12 @@ class OIDCHandler(BaseHTTPRequestHandler):
             del AUTH_CODES[code]
 
             # Set user data for authorization code
+            custom_claims = code_data.get('custom_claims', {}) or {}
             user_email = code_data.get('username', '')
+            # allow custom claims to override the email/sub
+            if isinstance(custom_claims, dict):
+                user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
             user_roles = code_data.get('roles', [''])
-            custom_claims = {}  # Initialize custom claims
             logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles}")
 
         elif grant_type == 'client_credentials':
