@@ -6,6 +6,7 @@ Run this server before starting the gateway when testing with OIDC.
 The gateway can then validate tokens against this server.
 """
 
+import base64
 import json
 import uuid
 import jwt
@@ -17,6 +18,12 @@ from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, unquote
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +48,84 @@ if BASE_PATH:
         BASE_PATH = '/' + BASE_PATH
     if BASE_PATH.endswith('/') and BASE_PATH != '/':
         BASE_PATH = BASE_PATH.rstrip('/')
+
+
+def _int_to_base64url(i: int) -> str:
+    """Encode a positive integer as base64url (JWK n/e)."""
+    byt = i.to_bytes((i.bit_length() + 7) // 8 or 1, 'big')
+    return base64.urlsafe_b64encode(byt).decode().rstrip('=')
+
+
+def _load_rsa_key_and_jwks():
+    """Load or generate RSA key pair and build JWKS with x5c. Returns (private_key_pem, public_key, jwks_keys)."""
+    private_key = None
+    cert_pem = None
+
+    # Optional: load private key from env (path or PEM)
+    key_src = os.getenv('OIDC_RSA_PRIVATE_KEY', '').strip()
+    if key_src:
+        if os.path.isfile(key_src):
+            with open(key_src, 'rb') as f:
+                key_pem = f.read()
+        else:
+            key_pem = key_src.encode() if isinstance(key_src, str) else key_src
+        private_key = serialization.load_pem_private_key(key_pem, password=None)
+
+    # Optional: load cert for x5c (path or PEM)
+    cert_src = os.getenv('OIDC_X509_CERT', '').strip()
+    if cert_src:
+        if os.path.isfile(cert_src):
+            with open(cert_src, 'rb') as f:
+                cert_pem = f.read()
+        else:
+            cert_pem = cert_src.encode() if isinstance(cert_src, str) else cert_src
+
+    if private_key is None:
+        # Generate RSA key and self-signed cert for x5c
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "mock-oidc"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.now(timezone.utc))
+            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .sign(private_key, hashes.SHA256())
+        )
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+
+    public_key = private_key.public_key()
+    numbers = public_key.public_numbers()
+    kid = "mock-oidc-rs256"
+
+    jwk = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": kid,
+        "n": _int_to_base64url(numbers.n),
+        "e": _int_to_base64url(numbers.e),
+    }
+    if cert_pem:
+        # x5c: array of base64-encoded DER certs (use first cert from PEM)
+        cert_obj = x509.load_pem_x509_certificate(cert_pem)
+        der = cert_obj.public_bytes(serialization.Encoding.DER)
+        jwk["x5c"] = [base64.b64encode(der).decode()]
+
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return private_key_pem, public_key, [jwk]
+
+
+RSA_PRIVATE_KEY, RSA_PUBLIC_KEY, JWKS_KEYS = _load_rsa_key_and_jwks()
+JWT_KEY_ID = JWKS_KEYS[0]["kid"] if JWKS_KEYS else "mock-oidc-rs256"
 
 # Store authorization codes temporarily (in production, use Redis or similar)
 AUTH_CODES = {}
@@ -364,7 +449,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "response_types_supported": ["code", "token", "id_token"],
             "grant_types_supported": ["authorization_code", "client_credentials"],
             "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["HS256"],
+            "id_token_signing_alg_values_supported": ["RS256"],
         }
 
         self.send_response(200)
@@ -564,7 +649,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
         # Add any custom claims
         payload.update(custom_claims)
 
-        token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+        token = jwt.encode(
+            payload, RSA_PRIVATE_KEY, algorithm="RS256",
+            headers={"kid": JWT_KEY_ID}
+        )
 
         # Store token data for /userinfo endpoint
         TOKEN_DATA[token] = {
@@ -613,7 +701,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
         # Decode and validate JWT token
         try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            payload = jwt.decode(token, RSA_PUBLIC_KEY, algorithms=["RS256"])
             
             # Check if token is expired
             exp = payload.get('exp', 0)
@@ -665,9 +753,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else 'unknown'
         logger.info(f"JWKS requested from {client_ip}")
 
-        jwks = {
-            "keys": []
-        }
+        jwks = {"keys": JWKS_KEYS}
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -711,7 +797,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "groups": groups  # OIDC standard claim; use SCIM group IDs
         }
         
-        token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+        token = jwt.encode(
+            payload, RSA_PRIVATE_KEY, algorithm="RS256",
+            headers={"kid": JWT_KEY_ID}
+        )
         
         # Store token data for /userinfo endpoint
         TOKEN_DATA[token] = {

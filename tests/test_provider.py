@@ -45,10 +45,19 @@ def test_discovery_and_jwks(running_server):
     assert doc.get('issuer') == provider.ISSUER
     assert 'token_endpoint' in doc
 
-    # JWKS
+    # JWKS: RS256 key with x5c (client expects RS256/x5c)
     r = requests.get(f"{base}/jwks")
     assert r.status_code == 200
-    assert isinstance(r.json().get('keys'), list)
+    jwks = r.json()
+    keys = jwks.get('keys', [])
+    assert isinstance(keys, list)
+    assert len(keys) >= 1
+    key = keys[0]
+    assert key.get('kty') == 'RSA'
+    assert key.get('alg') == 'RS256'
+    assert 'n' in key and 'e' in key
+    assert 'x5c' in key
+    assert len(key['x5c']) >= 1
 
 
 def test_authorization_code_flow_and_userinfo(running_server):
@@ -95,8 +104,8 @@ def test_authorization_code_flow_and_userinfo(running_server):
 
     access_token = token_json['access_token']
 
-    # Validate JWT
-    decoded = jwt.decode(access_token, provider.JWT_SECRET, algorithms=['HS256'])
+    # Validate JWT (RS256, public key)
+    decoded = jwt.decode(access_token, provider.RSA_PUBLIC_KEY, algorithms=['RS256'])
     assert decoded.get('sub') == 'alice'
     assert 'groups' in decoded or provider.ROLES_CLAIM in decoded
 
@@ -121,7 +130,7 @@ def test_client_credentials_flow(running_server):
     tok = r.json().get('access_token')
     assert tok
 
-    decoded = jwt.decode(tok, provider.JWT_SECRET, algorithms=['HS256'])
+    decoded = jwt.decode(tok, provider.RSA_PUBLIC_KEY, algorithms=['RS256'])
     # roles claim may be in the configured ROLES_CLAIM
     roles = decoded.get(provider.ROLES_CLAIM, [])
     assert 'admin' in roles or 'service' in roles
@@ -134,7 +143,7 @@ def test_test_token_endpoint(running_server):
     assert r.status_code == 200
     tok = r.json().get('access_token')
     assert tok
-    decoded = jwt.decode(tok, provider.JWT_SECRET, algorithms=['HS256'])
+    decoded = jwt.decode(tok, provider.RSA_PUBLIC_KEY, algorithms=['RS256'])
     assert decoded.get('sub') == 'bob'
     assert decoded.get('groups') == ['admin', 'dev']
 
