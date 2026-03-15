@@ -104,9 +104,13 @@ def test_authorization_code_flow_and_userinfo(running_server):
 
     access_token = token_json['access_token']
 
-    # Validate JWT (RS256, public key)
-    decoded = jwt.decode(access_token, provider.RSA_PUBLIC_KEY, algorithms=['RS256'])
+    # Validate JWT (RS256, public key); aud must be the initiating client_id
+    decoded = jwt.decode(
+        access_token, provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience=provider.CLIENT_ID
+    )
     assert decoded.get('sub') == 'alice'
+    assert decoded.get('aud') == provider.CLIENT_ID
     assert 'groups' in decoded or provider.ROLES_CLAIM in decoded
 
     # Step 4: Call userinfo
@@ -130,7 +134,11 @@ def test_client_credentials_flow(running_server):
     tok = r.json().get('access_token')
     assert tok
 
-    decoded = jwt.decode(tok, provider.RSA_PUBLIC_KEY, algorithms=['RS256'])
+    decoded = jwt.decode(
+        tok, provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience=provider.CLIENT_ID
+    )
+    assert decoded.get('aud') == provider.CLIENT_ID
     # roles claim may be in the configured ROLES_CLAIM
     roles = decoded.get(provider.ROLES_CLAIM, [])
     assert 'admin' in roles or 'service' in roles
@@ -143,7 +151,21 @@ def test_test_token_endpoint(running_server):
     assert r.status_code == 200
     tok = r.json().get('access_token')
     assert tok
-    decoded = jwt.decode(tok, provider.RSA_PUBLIC_KEY, algorithms=['RS256'])
+    decoded = jwt.decode(
+        tok, provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience=provider.CLIENT_ID
+    )
     assert decoded.get('sub') == 'bob'
+    assert decoded.get('aud') == provider.CLIENT_ID  # default when no client_id in query
     assert decoded.get('groups') == ['admin', 'dev']
+
+    # Optional client_id query param sets aud
+    r2 = requests.get(f"{base}/test-token/carol?groups=user&client_id=my-app")
+    assert r2.status_code == 200
+    decoded2 = jwt.decode(
+        r2.json()['access_token'], provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience='my-app'
+    )
+    assert decoded2.get('aud') == 'my-app'
+    assert decoded2.get('sub') == 'carol'
 

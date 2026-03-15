@@ -535,6 +535,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             if isinstance(custom_claims, dict):
                 user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
             user_roles = code_data.get('roles', [''])
+            audience = code_data.get('client_id', CLIENT_ID)
             logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles}")
 
         elif grant_type == 'client_credentials':
@@ -625,6 +626,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 user_email = custom_claims['email']
                 del custom_claims['email']  # Remove from custom claims since it's handled separately
 
+            audience = client_id or params.get('client_id', [''])[0] or CLIENT_ID
             logger.info(f"Client credentials token issued for {user_email} from {client_ip} - roles: {user_roles}")
 
         else:
@@ -636,10 +638,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "unsupported_grant_type"}).encode())
             return
         
-        # Generate JWT token
+        # Generate JWT token (id_token/access_token: aud = initiating client_id)
         payload = {
             "iss": ISSUER,
             "sub": user_email,
+            "aud": audience,
             "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()),
             "iat": int(datetime.now(timezone.utc).timestamp()),
             "email": user_email,
@@ -699,9 +702,12 @@ class OIDCHandler(BaseHTTPRequestHandler):
         # Extract token
         token = auth_header[7:]  # Remove 'Bearer ' prefix
 
-        # Decode and validate JWT token
+        # Decode and validate JWT token (we are the issuer; signature only, no aud check)
         try:
-            payload = jwt.decode(token, RSA_PUBLIC_KEY, algorithms=["RS256"])
+            payload = jwt.decode(
+                token, RSA_PUBLIC_KEY, algorithms=["RS256"],
+                options={"verify_aud": False}
+            )
             
             # Check if token is expired
             exp = payload.get('exp', 0)
@@ -786,11 +792,13 @@ class OIDCHandler(BaseHTTPRequestHandler):
         
         logger.info(f"Test token requested for user '{username}' with groups {groups} from {client_ip}")
         
-        # Generate token with specified groups
+        # Generate token with specified groups (aud = client_id from query or default)
         now = datetime.now(timezone.utc)
+        aud_client = params.get('client_id', [CLIENT_ID])[0] or CLIENT_ID
         payload = {
             "iss": ISSUER,
             "sub": username,
+            "aud": aud_client,
             "email": username,
             "exp": int((now + timedelta(hours=1)).timestamp()),
             "iat": int(now.timestamp()),
