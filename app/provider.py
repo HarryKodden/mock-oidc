@@ -17,8 +17,8 @@ import sys
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -51,6 +51,18 @@ if BASE_PATH:
         BASE_PATH = '/' + BASE_PATH
     if BASE_PATH.endswith('/') and BASE_PATH != '/':
         BASE_PATH = BASE_PATH.rstrip('/')
+
+
+def public_url(path: str) -> str:
+    """Absolute URL for this service (issuer + optional base path + path)."""
+    p = path if path.startswith('/') else '/' + path
+    return ISSUER.rstrip('/') + (BASE_PATH or '') + p
+
+
+def oauth_callback_uri() -> str:
+    """OAuth redirect_uri for the demo /callback page (must match authorize exactly)."""
+    return public_url('/callback')
+
 
 # RFC 8628 device flow: poll interval (seconds); set to 0 in tests to skip slow_down
 DEVICE_POLL_INTERVAL = int(os.getenv('DEVICE_POLL_INTERVAL', '5'))
@@ -175,6 +187,106 @@ USER_CODE_INDEX = {}
 # opaque refresh_token -> session (authorization_code / device_code / refresh rotation)
 REFRESH_TOKENS = {}
 
+
+def build_token_response(user_email, audience, user_roles, custom_claims, issue_refresh, client_ip_log):
+    """Issue access/id token (+ optional refresh). Mutates TOKEN_DATA / REFRESH_TOKENS. Returns JSON dict."""
+    now_tok = datetime.now(timezone.utc)
+    ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
+    payload = {
+        "iss": ISSUER,
+        "sub": user_email,
+        "aud": audience,
+        "exp": int((now_tok + ttl).timestamp()),
+        "iat": int(now_tok.timestamp()),
+        "email": user_email,
+        ROLES_CLAIM: user_roles,
+    }
+    payload.update(custom_claims)
+
+    token = jwt.encode(
+        payload, RSA_PRIVATE_KEY, algorithm="RS256",
+        headers={"kid": JWT_KEY_ID}
+    )
+
+    TOKEN_DATA[token] = {
+        'username': user_email,
+        'email': user_email,
+        'roles': user_roles,
+        'sub': user_email,
+        'expires': now_tok + ttl
+    }
+    TOKEN_DATA[token].update(custom_claims)
+
+    logger.info(f"Token generated for {user_email} from {client_ip_log} - token_id: {token[:20]}...")
+
+    response = {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": ACCESS_TOKEN_TTL_SEC,
+        "id_token": token,
+    }
+
+    if issue_refresh:
+        rt = secrets.token_urlsafe(48)
+        cc_store = dict(custom_claims) if isinstance(custom_claims, dict) else {}
+        REFRESH_TOKENS[rt] = {
+            'client_id': audience,
+            'audience': audience,
+            'user_email': user_email,
+            'user_roles': user_roles,
+            'custom_claims': cc_store,
+            'expires': now_tok + timedelta(seconds=REFRESH_TOKEN_TTL_SEC),
+        }
+        response["refresh_token"] = rt
+
+    return response
+
+
+def redeem_authorization_code_for_callback(code: str, redirect_uri: str):
+    """
+    In-process authorization-code exchange for GET /callback (avoids nested HTTP to /token).
+    Returns (token_response_dict, userinfo_dict). Raises ValueError on failure.
+    """
+    if code not in AUTH_CODES:
+        raise ValueError("invalid_grant")
+    code_data = AUTH_CODES[code]
+    if datetime.now(timezone.utc) > code_data['expires']:
+        del AUTH_CODES[code]
+        raise ValueError("expired_token")
+    if code_data.get('redirect_uri') != redirect_uri:
+        raise ValueError("invalid_grant")
+    stored_challenge = code_data.get('code_challenge', '')
+    stored_method = code_data.get('code_challenge_method', '')
+    if stored_challenge:
+        raise ValueError(
+            "PKCE was used on authorize; exchange tokens from your client with code_verifier "
+            "(the demo /callback page only supports non-PKCE flows)."
+        )
+
+    del AUTH_CODES[code]
+    custom_claims = code_data.get('custom_claims', {}) or {}
+    user_email = code_data.get('username', '')
+    if isinstance(custom_claims, dict):
+        user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
+    user_roles = code_data.get('roles', [''])
+    audience = code_data.get('client_id', CLIENT_ID)
+
+    response = build_token_response(
+        user_email, audience, user_roles, custom_claims, True, 'oauth-callback'
+    )
+    at = response['access_token']
+    payload = jwt.decode(at, RSA_PUBLIC_KEY, algorithms=['RS256'], options={'verify_aud': False})
+    userinfo = {
+        "sub": payload.get('sub', ''),
+        "email": payload.get('email', ''),
+        ROLES_CLAIM: payload.get(ROLES_CLAIM, []),
+    }
+    for key, value in payload.items():
+        if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', ROLES_CLAIM]:
+            userinfo[key] = value
+    return response, userinfo
+
+
 # Jinja2 templates environment
 _TEMPLATE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
 TEMPLATES = Environment(
@@ -252,6 +364,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_root()
         elif parsed_path.path == '/health':
             self.send_health()
+        elif parsed_path.path == '/callback':
+            self.handle_oauth_callback()
         elif parsed_path.path == '/.well-known/openid-configuration':
             self.send_discovery_document()
         elif parsed_path.path == '/authorize':
@@ -750,6 +864,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             html = template.render(
                 base_path=BASE_PATH,
                 client_id=CLIENT_ID,
+                client_secret=CLIENT_SECRET,
+                issuer=ISSUER,
+                callback_uri=oauth_callback_uri(),
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -764,6 +881,71 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 f'<html><body><p>mock-oidc</p><p><a href="{BASE_PATH or ""}/health">health</a></p></body></html>'.encode()
             )
 
+    def handle_oauth_callback(self):
+        """OAuth redirect target: exchange code for tokens, show userinfo, introspect/refresh UI."""
+        parsed_path = urlparse(self.path)
+        params = parse_qs(parsed_path.query)
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
+        code = params.get('code', [''])[0]
+        state = params.get('state', [''])[0]
+        oauth_err = params.get('error', [''])[0]
+        oauth_err_desc = params.get('error_description', [''])[0]
+
+        token_data = None
+        userinfo_data = None
+        access_claims = None
+        exchange_error = None
+        callback_uri = oauth_callback_uri()
+
+        if oauth_err:
+            logger.info(f"OAuth callback error from {client_ip}: {oauth_err}")
+        elif code:
+            try:
+                token_data, userinfo_data = redeem_authorization_code_for_callback(code, callback_uri)
+                at = token_data.get('access_token')
+                if at:
+                    try:
+                        access_claims = jwt.decode(
+                            at, RSA_PUBLIC_KEY, algorithms=['RS256'],
+                            options={'verify_aud': False}
+                        )
+                    except Exception:
+                        access_claims = None
+            except ValueError as e:
+                exchange_error = str(e)
+                logger.warning(f"Callback token exchange failed: {exchange_error}")
+            except Exception as e:
+                exchange_error = str(e)
+                logger.exception("Callback token exchange failed")
+
+        try:
+            template = TEMPLATES.get_template('callback.html')
+            html = template.render(
+                base_path=BASE_PATH,
+                issuer=ISSUER,
+                client_id=CLIENT_ID,
+                client_secret=CLIENT_SECRET,
+                callback_uri=callback_uri,
+                oauth_error=oauth_err,
+                oauth_error_description=oauth_err_desc,
+                state=state,
+                token_json=token_data,
+                userinfo_json=userinfo_data,
+                access_claims=access_claims,
+                exchange_error=exchange_error,
+            )
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(html.encode())
+        except Exception:
+            logger.exception("Failed to render callback.html")
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b"<html><body>callback error</body></html>")
+
     def send_discovery_document(self):
         """Send OpenID Connect discovery document"""
         client_ip = self.client_address[0] if self.client_address else 'unknown'
@@ -771,11 +953,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
         discovery = {
             "issuer": ISSUER,
-            "authorization_endpoint": f"{ISSUER}/authorize",
-            "token_endpoint": f"{ISSUER}/token",
-            "userinfo_endpoint": f"{ISSUER}/userinfo",
-            "jwks_uri": f"{ISSUER}/jwks",
-            "device_authorization_endpoint": f"{ISSUER}/device",
+            "authorization_endpoint": public_url("/authorize"),
+            "token_endpoint": public_url("/token"),
+            "userinfo_endpoint": public_url("/userinfo"),
+            "jwks_uri": public_url("/jwks"),
+            "device_authorization_endpoint": public_url("/device"),
             "response_types_supported": ["code", "token", "id_token"],
             "grant_types_supported": [
                 "authorization_code",
@@ -783,7 +965,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 "refresh_token",
                 "urn:ietf:params:oauth:grant-type:device_code",
             ],
-            "introspection_endpoint": f"{ISSUER}/introspect",
+            "introspection_endpoint": public_url("/introspect"),
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
             "code_challenge_methods_supported": ["S256", "plain"],
@@ -1092,61 +1274,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"error": "unsupported_grant_type"}).encode())
             return
-        
-        # Generate JWT token (id_token/access_token: aud = initiating client_id)
-        now_tok = datetime.now(timezone.utc)
-        ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
-        payload = {
-            "iss": ISSUER,
-            "sub": user_email,
-            "aud": audience,
-            "exp": int((now_tok + ttl).timestamp()),
-            "iat": int(now_tok.timestamp()),
-            "email": user_email,
-            ROLES_CLAIM: user_roles,
-        }
 
-        # Add any custom claims
-        payload.update(custom_claims)
-
-        token = jwt.encode(
-            payload, RSA_PRIVATE_KEY, algorithm="RS256",
-            headers={"kid": JWT_KEY_ID}
+        response = build_token_response(
+            user_email, audience, user_roles, custom_claims, issue_refresh, client_ip
         )
-
-        # Store token data for /userinfo endpoint
-        TOKEN_DATA[token] = {
-            'username': user_email,
-            'email': user_email,
-            'roles': user_roles,
-            'sub': user_email,
-            'expires': now_tok + ttl
-        }
-
-        # Add custom claims to token data
-        TOKEN_DATA[token].update(custom_claims)
-
-        logger.info(f"Token generated for {user_email} from {client_ip} - token_id: {token[:20]}...")
-
-        response = {
-            "access_token": token,
-            "token_type": "Bearer",
-            "expires_in": ACCESS_TOKEN_TTL_SEC,
-            "id_token": token,
-        }
-
-        if issue_refresh:
-            rt = secrets.token_urlsafe(48)
-            cc_store = dict(custom_claims) if isinstance(custom_claims, dict) else {}
-            REFRESH_TOKENS[rt] = {
-                'client_id': audience,
-                'audience': audience,
-                'user_email': user_email,
-                'user_roles': user_roles,
-                'custom_claims': cc_store,
-                'expires': now_tok + timedelta(seconds=REFRESH_TOKEN_TTL_SEC),
-            }
-            response["refresh_token"] = rt
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -1436,6 +1567,7 @@ def main():
     logger.info("=" * 50)
     logger.info(f"Root: {ISSUER}/")
     logger.info(f"Health: {ISSUER}/health")
+    logger.info(f"OAuth callback (demo): {oauth_callback_uri()}")
     logger.info(f"Discovery: {ISSUER}/.well-known/openid-configuration")
     logger.info(f"Token: {ISSUER}/token")
     logger.info(f"UserInfo: {ISSUER}/userinfo")
@@ -1454,7 +1586,7 @@ def main():
     logger.info("")
 
     try:
-        server = HTTPServer(('0.0.0.0', PORT), OIDCHandler)
+        server = ThreadingHTTPServer(('0.0.0.0', PORT), OIDCHandler)
         logger.info("✓ Server started successfully")
 
         # Clean up expired tokens every 5 minutes

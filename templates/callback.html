@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OAuth callback — mock-oidc</title>
+  <link rel="stylesheet" href="{{ base_path }}/static/styles.css">
+  <style>
+    .callback-pre { background: #f6f8fa; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; text-align: left; max-height: 280px; overflow-y: auto; }
+    .callback-section { margin-top: 20px; text-align: left; }
+    .callback-section h2 { font-size: 15px; color: #333; margin-bottom: 8px; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .btn-row button { width: auto; padding: 10px 16px; font-size: 13px; }
+    .err { color: #b91c1c; background: #fef2f2; padding: 12px; border-radius: 8px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="login-container" style="max-width: 640px;">
+    <h1>OAuth callback</h1>
+    <p class="subtitle">Redirect URI: <code>{{ callback_uri }}</code></p>
+
+    {% if oauth_error %}
+    <div class="err">
+      <strong>{{ oauth_error }}</strong>
+      {% if oauth_error_description %}<p>{{ oauth_error_description }}</p>{% endif %}
+    </div>
+    {% endif %}
+
+    {% if exchange_error %}
+    <div class="err">Token exchange failed: {{ exchange_error }}</div>
+    {% endif %}
+
+    {% if state %}
+    <p style="font-size: 13px; color: #666;">state: <code>{{ state }}</code></p>
+    {% endif %}
+
+    {% if token_json %}
+    <div class="callback-section">
+      <h2>Token response</h2>
+      <pre class="callback-pre" id="tokenResponse">{{ token_json | tojson(indent=2) }}</pre>
+    </div>
+    {% endif %}
+
+    {% if access_claims %}
+    <div class="callback-section">
+      <h2>Access token claims (decoded JWT)</h2>
+      <pre class="callback-pre">{{ access_claims | tojson(indent=2) }}</pre>
+    </div>
+    {% endif %}
+
+    {% if userinfo_json %}
+    <div class="callback-section">
+      <h2>UserInfo</h2>
+      <pre class="callback-pre">{{ userinfo_json | tojson(indent=2) }}</pre>
+    </div>
+    {% endif %}
+
+    {% if token_json %}
+    <div class="callback-section">
+      <h2>More actions</h2>
+      <p style="font-size: 12px; color: #666;">Uses the configured client id/secret (mock only).</p>
+      <div class="btn-row">
+        <button type="button" id="btnIntroAccess">Introspect access token</button>
+        <button type="button" id="btnIntroRefresh" {% if 'refresh_token' not in token_json %}disabled{% endif %}>Introspect refresh token</button>
+        <button type="button" id="btnRefresh" {% if 'refresh_token' not in token_json %}disabled{% endif %}>Refresh tokens</button>
+      </div>
+      <pre class="callback-pre" id="actionOut" style="display:none; margin-top:12px;"></pre>
+    </div>
+    {% endif %}
+
+    <p style="margin-top: 24px;"><a href="{{ base_path }}/">← Back to home</a></p>
+  </div>
+
+  {% if token_json %}
+  <script>
+    (function(){
+      const base = {{ (base_path or '')|tojson }};
+      const clientId = {{ client_id|tojson }};
+      const clientSecret = {{ client_secret|tojson }};
+      const tokenJson = {{ token_json|tojson }};
+      const out = document.getElementById('actionOut');
+
+      function show(json) {
+        out.style.display = 'block';
+        out.textContent = typeof json === 'string' ? json : JSON.stringify(json, null, 2);
+      }
+
+      async function postForm(url, params) {
+        const body = new URLSearchParams(params);
+        const r = await fetch(base + url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
+        const text = await r.text();
+        try { return JSON.parse(text); } catch (e) { return text; }
+      }
+
+      document.getElementById('btnIntroAccess').onclick = async function() {
+        const j = await postForm('/introspect', {
+          token: tokenJson.access_token,
+          client_id: clientId,
+          client_secret: clientSecret
+        });
+        show(j);
+      };
+      document.getElementById('btnIntroRefresh').onclick = async function() {
+        if (!tokenJson.refresh_token) return;
+        const j = await postForm('/introspect', {
+          token: tokenJson.refresh_token,
+          client_id: clientId,
+          client_secret: clientSecret
+        });
+        show(j);
+      };
+      document.getElementById('btnRefresh').onclick = async function() {
+        if (!tokenJson.refresh_token) return;
+        const j = await postForm('/token', {
+          grant_type: 'refresh_token',
+          refresh_token: tokenJson.refresh_token,
+          client_id: clientId,
+          client_secret: clientSecret
+        });
+        show(j);
+      };
+    })();
+  </script>
+  {% endif %}
+</body>
+</html>

@@ -10,7 +10,7 @@ import jwt
 import requests
 import pytest
 
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 
 from app import provider
 
@@ -24,7 +24,7 @@ def running_server():
     provider.REFRESH_TOKENS.clear()
     provider.DEVICE_POLL_INTERVAL = 0  # skip slow_down between polls in tests
 
-    server = HTTPServer(('127.0.0.1', 0), provider.OIDCHandler)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), provider.OIDCHandler)
     port = server.server_address[1]
 
     # Ensure provider uses the test server URL
@@ -423,4 +423,46 @@ def test_refresh_token_and_introspection(running_server):
     )
     assert stale.status_code == 400
     assert stale.json().get('error') == 'invalid_grant'
+
+
+def test_root_callback_uri_and_oauth_callback_page(running_server):
+    base = running_server
+    cb = provider.oauth_callback_uri()
+    assert cb == f"{base}/callback"
+
+    root = requests.get(f"{base}/")
+    assert cb.replace("&", "&amp;") in root.text or cb in root.text
+    assert "device" in root.text.lower()
+
+    err = requests.get(f"{base}/callback", params={"error": "access_denied", "error_description": "nope"})
+    assert err.status_code == 200
+    assert "access_denied" in err.text
+
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            "client_id": provider.CLIENT_ID,
+            "redirect_uri": cb,
+            "response_type": "code",
+            "state": "cb-state",
+        },
+    )
+    assert r.status_code == 200
+    r = requests.post(
+        f"{base}/authorize",
+        data={
+            "username": "callback-user",
+            "roles": "admin",
+            "client_id": provider.CLIENT_ID,
+            "redirect_uri": cb,
+            "state": "cb-state",
+            "response_type": "code",
+        },
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    loc = r.headers["Location"]
+    r2 = requests.get(loc)
+    assert r2.status_code == 200
+    assert "callback-user" in r2.text or "access_token" in r2.text
 

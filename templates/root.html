@@ -11,20 +11,28 @@
     .root-links a { color: #667eea; font-weight: 500; text-decoration: none; }
     .root-links a:hover { text-decoration: underline; }
     .root-links code { display: block; font-size: 11px; color: #666; margin-top: 4px; font-weight: normal; }
+    .device-box { margin-top: 24px; text-align: left; }
+    .device-box h2 { font-size: 15px; color: #333; margin-bottom: 10px; }
+    .device-box button { width: auto; display: inline-block; padding: 10px 18px; font-size: 14px; margin-right: 8px; margin-bottom: 8px; }
+    .device-pre { background: #f6f8fa; padding: 12px; border-radius: 8px; font-size: 11px; overflow-x: auto; text-align: left; max-height: 220px; margin-top: 12px; display: none; }
+    .device-pre.show { display: block; }
+    .device-links { margin-top: 10px; font-size: 13px; }
   </style>
 </head>
 <body>
-  <div class="login-container" style="max-width: 520px;">
+  <div class="login-container" style="max-width: 560px;">
     <h1>mock-oidc</h1>
     <p class="subtitle">OIDC test provider — development only</p>
+    <p style="font-size: 12px; color: #666;">Issuer: <code>{{ issuer }}</code></p>
+
     <ul class="root-links">
       <li>
         <a href="{{ base_path }}/.well-known/openid-configuration">OpenID discovery</a>
         <code>GET /.well-known/openid-configuration</code>
       </li>
       <li>
-        <a href="{{ base_path }}/authorize?client_id={{ client_id }}&amp;redirect_uri=https://example.com/callback&amp;response_type=code&amp;state=xyz">Authorize (example link)</a>
-        <code>GET /authorize</code>
+        <a href="{{ base_path }}/authorize?client_id={{ client_id }}&amp;redirect_uri={{ callback_uri|urlencode }}&amp;response_type=code&amp;state=landing">Sign in (authorization code → this host /callback)</a>
+        <code>redirect_uri={{ callback_uri }}</code>
       </li>
       <li>
         <a href="{{ base_path }}/jwks">JWKS</a>
@@ -38,9 +46,95 @@
         <a href="https://github.com/HarryKodden/mock-oidc" rel="noopener noreferrer">GitHub repository</a>
       </li>
     </ul>
+
+    <div class="device-box">
+      <h2>Device code flow</h2>
+      <p style="font-size: 12px; color: #666;">Starts RFC 8628 device authorization, then polls <code>/token</code> until you complete <code>/device/verify</code> in another tab.</p>
+      <button type="button" id="startDevice">Start device authorization</button>
+      <button type="button" id="pollDevice" disabled>Poll for tokens</button>
+      <button type="button" id="stopPoll" disabled>Stop polling</button>
+      <div class="device-links" id="deviceLinks" style="display:none;"></div>
+      <pre class="device-pre" id="devicePre"></pre>
+    </div>
+
     <div class="info-box">
-      Use <strong>POST /token</strong>, <strong>GET /userinfo</strong>, <strong>POST /introspect</strong>, and the device flow at <strong>/device</strong> — see the README for details.
+      After sign-in you land on <strong>/callback</strong> with tokens and UserInfo. Use <strong>POST /token</strong>, <strong>GET /userinfo</strong>, <strong>POST /introspect</strong> as needed.
     </div>
   </div>
+
+  <script>
+    (function(){
+      const base = {{ (base_path or '')|tojson }};
+      const clientId = {{ client_id|tojson }};
+      const clientSecret = {{ client_secret|tojson }};
+      const issuer = {{ issuer|tojson }};
+
+      let deviceCode = null;
+      let pollTimer = null;
+
+      const pre = document.getElementById('devicePre');
+      const links = document.getElementById('deviceLinks');
+      const btnPoll = document.getElementById('pollDevice');
+      const btnStop = document.getElementById('stopPoll');
+
+      function show(obj) {
+        pre.classList.add('show');
+        pre.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+      }
+
+      document.getElementById('startDevice').onclick = async function() {
+        const body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret });
+        const r = await fetch(base + '/device', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
+        const j = await r.json();
+        if (!r.ok) { show(j); return; }
+        deviceCode = j.device_code;
+        show(j);
+        links.style.display = 'block';
+        links.innerHTML = '<a href="' + j.verification_uri + '" target="_blank" rel="noopener">Open verification page</a> · ' +
+          '<a href="' + (j.verification_uri_complete || '') + '" target="_blank" rel="noopener">Open with user code</a>';
+        btnPoll.disabled = false;
+      };
+
+      async function pollOnce() {
+        if (!deviceCode) return;
+        const body = new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+          device_code: deviceCode,
+          client_id: clientId,
+          client_secret: clientSecret
+        });
+        const r = await fetch(base + '/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString() });
+        const text = await r.text();
+        let j;
+        try { j = JSON.parse(text); } catch (e) { show(text); return; }
+        if (r.ok) {
+          show({ done: true, token_response: j });
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          btnStop.disabled = true;
+          btnPoll.disabled = true;
+          return;
+        }
+        if (j.error === 'authorization_pending' || j.error === 'slow_down') {
+          show({ polling: j.error, hint: 'Complete /device/verify in the other tab…' });
+          return;
+        }
+        show(j);
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        btnStop.disabled = true;
+      }
+
+      btnPoll.onclick = function() {
+        if (!deviceCode) return;
+        btnStop.disabled = false;
+        pollOnce();
+        pollTimer = setInterval(pollOnce, 3000);
+      };
+
+      btnStop.onclick = function() {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        btnStop.disabled = true;
+      };
+    })();
+  </script>
 </body>
 </html>

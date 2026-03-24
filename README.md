@@ -7,7 +7,7 @@ A small, standalone OpenID Connect (OIDC) test provider for local development an
 
 ## Features
 
-- **Landing & health** — `GET /` serves a small HTML page with links to discovery, authorize, JWKS, and the repo. **`GET /health`** returns JSON (`status`, `issuer`, `version`) for Docker/Kubernetes probes.
+- **Landing & health** — `GET /` serves a small HTML page with links to discovery, authorize, JWKS, OAuth callback demo, and device-flow helpers. **`GET /callback`** receives the authorization redirect (`redirect_uri={issuer}{BASE_PATH}/callback`), shows tokens, UserInfo, and introspection/refresh helpers (see [Landing page demo](#landing-page-demo)). **`GET /health`** returns JSON (`status`, `issuer`, `version`) for Docker/Kubernetes probes.
 - **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, grant types, **`introspection_endpoint`**, **`code_challenge_methods_supported`** for PKCE).
 - **Signing** — Access and ID tokens are **RS256** JWTs. **`GET /jwks`** exposes the public key with **`x5c`** (self-signed cert by default) so clients that require RS256/x5c can validate remotely.
 - **Authorization code flow** — `GET/POST /authorize` with a browser form to compose **claims** (JSON-backed rows: `sub`, `email`, `groups`, etc.). Redirects with `code`.
@@ -43,6 +43,12 @@ pip install -r requirements.txt
 ```bash
 python -c "from app import provider; provider.main()"
 ```
+
+### Landing page demo
+
+- **`GET /`** — Includes an **Authorize** link that uses **`redirect_uri={issuer}{BASE_PATH}/callback`** (must match the value you send to `/authorize` exactly), plus a **device code** section to request `device_code` / `user_code`, open verification URLs, and poll **`POST /token`** until tokens are issued.
+- **`GET /callback`** — After sign-in, the browser returns here with `?code=...&state=...`. The provider exchanges the code **in-process** (no nested HTTP call to `/token`) and renders token JSON, decoded access-token claims, **UserInfo**, and buttons that call **introspection** and **refresh** via `fetch` (demo only: client id/secret are embedded in the page HTML).
+- **PKCE** — If you start `/authorize` **with** `code_challenge`, complete the flow with **`POST /token`** and **`code_verifier`**. The **`/callback`** page only supports **non-PKCE** authorization code exchanges.
 
 3. Examples
 
