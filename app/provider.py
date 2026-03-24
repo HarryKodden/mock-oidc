@@ -36,6 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PORT = 8888
+SERVICE_VERSION = os.getenv('MOCK_OIDC_VERSION', 'dev')
 JWT_SECRET = os.getenv('SECRET', "test-jwt-secret-key-do-not-use-in-production")
 ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
@@ -247,7 +248,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 pass
 
         # Route using the (possibly stripped) parsed_path
-        if parsed_path.path == '/.well-known/openid-configuration':
+        if parsed_path.path == '/':
+            self.send_root()
+        elif parsed_path.path == '/health':
+            self.send_health()
+        elif parsed_path.path == '/.well-known/openid-configuration':
             self.send_discovery_document()
         elif parsed_path.path == '/authorize':
             self.handle_authorize()
@@ -720,6 +725,45 @@ class OIDCHandler(BaseHTTPRequestHandler):
             )
         logger.info(f"Device grant approved for user {username} from {client_ip}")
     
+    def send_health(self):
+        """Liveness/readiness probe — JSON for orchestrators and Docker HEALTHCHECK."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"Health check from {client_ip}")
+        body = {
+            "status": "ok",
+            "service": "mock-oidc",
+            "issuer": ISSUER,
+            "version": SERVICE_VERSION,
+        }
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def send_root(self):
+        """Landing page with links to discovery, authorize, and other entry points."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"Root page requested from {client_ip}")
+        try:
+            template = TEMPLATES.get_template('root.html')
+            html = template.render(
+                base_path=BASE_PATH,
+                client_id=CLIENT_ID,
+            )
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(html.encode())
+        except Exception as e:
+            logger.exception("Failed to render root.html")
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(
+                f'<html><body><p>mock-oidc</p><p><a href="{BASE_PATH or ""}/health">health</a></p></body></html>'.encode()
+            )
+
     def send_discovery_document(self):
         """Send OpenID Connect discovery document"""
         client_ip = self.client_address[0] if self.client_address else 'unknown'
@@ -1390,6 +1434,8 @@ def main():
     logger.info(f"Roles Claim: {ROLES_CLAIM}")
     logger.info(f"Strict client auth: {STRICT_CLIENT_AUTH}")
     logger.info("=" * 50)
+    logger.info(f"Root: {ISSUER}/")
+    logger.info(f"Health: {ISSUER}/health")
     logger.info(f"Discovery: {ISSUER}/.well-known/openid-configuration")
     logger.info(f"Token: {ISSUER}/token")
     logger.info(f"UserInfo: {ISSUER}/userinfo")

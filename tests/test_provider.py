@@ -42,6 +42,25 @@ def running_server():
     thread.join(timeout=1)
 
 
+def test_health_and_root(running_server):
+    base = running_server
+
+    h = requests.get(f"{base}/health")
+    assert h.status_code == 200
+    hj = h.json()
+    assert hj.get("status") == "ok"
+    assert hj.get("service") == "mock-oidc"
+    assert hj.get("issuer") == provider.ISSUER
+    assert "version" in hj
+
+    root = requests.get(f"{base}/")
+    assert root.status_code == 200
+    assert "text/html" in root.headers.get("Content-Type", "")
+    text = root.text.lower()
+    assert "mock-oidc" in text
+    assert "openid-configuration" in text
+
+
 def test_discovery_and_jwks(running_server):
     base = running_server
 

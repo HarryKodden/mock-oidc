@@ -7,6 +7,7 @@ A small, standalone OpenID Connect (OIDC) test provider for local development an
 
 ## Features
 
+- **Landing & health** — `GET /` serves a small HTML page with links to discovery, authorize, JWKS, and the repo. **`GET /health`** returns JSON (`status`, `issuer`, `version`) for Docker/Kubernetes probes.
 - **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, grant types, **`introspection_endpoint`**, **`code_challenge_methods_supported`** for PKCE).
 - **Signing** — Access and ID tokens are **RS256** JWTs. **`GET /jwks`** exposes the public key with **`x5c`** (self-signed cert by default) so clients that require RS256/x5c can validate remotely.
 - **Authorization code flow** — `GET/POST /authorize` with a browser form to compose **claims** (JSON-backed rows: `sub`, `email`, `groups`, etc.). Redirects with `code`.
@@ -44,6 +45,11 @@ python -c "from app import provider; provider.main()"
 ```
 
 3. Examples
+
+- **Health (for orchestration):**
+  ```bash
+  curl -s http://localhost:8888/health | jq
+  ```
 
 - **Discovery and JWKS:**
   ```bash
@@ -184,6 +190,7 @@ Defaults apply when a variable is unset.
 | `DEVICE_EXPIRES_SEC` | `600` | Lifetime (seconds) of a device authorization session. |
 | `ACCESS_TOKEN_TTL_SEC` | `3600` | Access / ID token lifetime in seconds (`exp`, `expires_in`, and `/userinfo` validation). |
 | `REFRESH_TOKEN_TTL_SEC` | `604800` (7 days) | Refresh token lifetime for authorization code and device code flows. |
+| `MOCK_OIDC_VERSION` | `dev` | Shown in **`GET /health`** JSON (`version` field); set to your app or image tag in Docker/Kubernetes. |
 
 **Notes**
 

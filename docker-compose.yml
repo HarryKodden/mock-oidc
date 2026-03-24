@@ -14,7 +14,7 @@ services:
       - ROLES_CLAIM=Groups
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8888/.well-known/openid-configuration"]
+      test: ["CMD", "curl", "-f", "http://localhost:8888/health"]
       interval: 10s
       timeout: 5s
       retries: 5

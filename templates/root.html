@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>mock-oidc</title>
+  <link rel="stylesheet" href="{{ base_path }}/static/styles.css">
+  <style>
+    .root-links { list-style: none; padding: 0; margin: 24px 0 0; }
+    .root-links li { margin: 12px 0; }
+    .root-links a { color: #667eea; font-weight: 500; text-decoration: none; }
+    .root-links a:hover { text-decoration: underline; }
+    .root-links code { display: block; font-size: 11px; color: #666; margin-top: 4px; font-weight: normal; }
+  </style>
+</head>
+<body>
+  <div class="login-container" style="max-width: 520px;">
+    <h1>mock-oidc</h1>
+    <p class="subtitle">OIDC test provider — development only</p>
+    <ul class="root-links">
+      <li>
+        <a href="{{ base_path }}/.well-known/openid-configuration">OpenID discovery</a>
+        <code>GET /.well-known/openid-configuration</code>
+      </li>
+      <li>
+        <a href="{{ base_path }}/authorize?client_id={{ client_id }}&amp;redirect_uri=https://example.com/callback&amp;response_type=code&amp;state=xyz">Authorize (example link)</a>
+        <code>GET /authorize</code>
+      </li>
+      <li>
+        <a href="{{ base_path }}/jwks">JWKS</a>
+        <code>GET /jwks</code>
+      </li>
+      <li>
+        <a href="{{ base_path }}/health">Health (JSON)</a>
+        <code>GET /health</code>
+      </li>
+      <li>
+        <a href="https://github.com/HarryKodden/mock-oidc" rel="noopener noreferrer">GitHub repository</a>
+      </li>
+    </ul>
+    <div class="info-box">
+      Use <strong>POST /token</strong>, <strong>GET /userinfo</strong>, <strong>POST /introspect</strong>, and the device flow at <strong>/device</strong> — see the README for details.
+    </div>
+  </div>
+</body>
+</html>
