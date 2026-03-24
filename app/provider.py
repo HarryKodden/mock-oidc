@@ -7,6 +7,7 @@ The gateway can then validate tokens against this server.
 """
 
 import base64
+import hashlib
 import json
 import re
 import uuid
@@ -53,6 +54,8 @@ if BASE_PATH:
 # RFC 8628 device flow: poll interval (seconds); set to 0 in tests to skip slow_down
 DEVICE_POLL_INTERVAL = int(os.getenv('DEVICE_POLL_INTERVAL', '5'))
 DEVICE_EXPIRES_SEC = int(os.getenv('DEVICE_EXPIRES_SEC', '600'))
+ACCESS_TOKEN_TTL_SEC = int(os.getenv('ACCESS_TOKEN_TTL_SEC', '3600'))
+REFRESH_TOKEN_TTL_SEC = int(os.getenv('REFRESH_TOKEN_TTL_SEC', str(7 * 24 * 3600)))
 
 
 def _normalize_user_code(code: str) -> str:
@@ -66,6 +69,21 @@ def _generate_user_code() -> str:
     a = ''.join(secrets.choice(alphabet) for _ in range(4))
     b = ''.join(secrets.choice(alphabet) for _ in range(4))
     return f'{a}-{b}'
+
+
+def _verify_pkce(stored_challenge: str, stored_method: str, code_verifier: str) -> bool:
+    """RFC 7636: check code_verifier against stored code_challenge for S256 or plain."""
+    if not stored_challenge or not code_verifier:
+        return False
+    m = (stored_method or "S256").upper()
+    if m == "S256":
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).decode().rstrip("=")
+        return expected == stored_challenge
+    if m == "PLAIN":
+        return code_verifier == stored_challenge
+    return False
 
 
 def _int_to_base64url(i: int) -> str:
@@ -153,6 +171,8 @@ TOKEN_DATA = {}
 DEVICE_GRANTS = {}
 # normalized user_code -> device_code (pending grants only)
 USER_CODE_INDEX = {}
+# opaque refresh_token -> session (authorization_code / device_code / refresh rotation)
+REFRESH_TOKENS = {}
 
 # Jinja2 templates environment
 _TEMPLATE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
@@ -269,6 +289,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
         if parsed_path.path == '/token':
             self.send_token()
+        elif parsed_path.path == '/introspect':
+            self.send_introspect()
         elif parsed_path.path == '/authorize':
             self.handle_authorize_post()
         elif parsed_path.path == '/device':
@@ -293,6 +315,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
         state = params.get('state', [''])[0]
         response_type = params.get('response_type', [''])[0]
         code_challenge = params.get('code_challenge', [''])[0]
+        code_challenge_method = params.get('code_challenge_method', [''])[0]
+        if code_challenge and not code_challenge_method:
+            code_challenge_method = "S256"
 
         logger.info(f"Authorization request from {client_ip} - client_id: {client_id}, response_type: {response_type}")
 
@@ -412,6 +437,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             redirect_uri = post_params.get('redirect_uri', [''])[0]
             state = post_params.get('state', [''])[0]
             code_challenge = post_params.get('code_challenge', [''])[0]
+            code_challenge_method = post_params.get('code_challenge_method', [''])[0]
+            if code_challenge and not code_challenge_method:
+                code_challenge_method = "S256"
 
             # Generate authorization code
             auth_code = secrets.token_urlsafe(32)
@@ -421,6 +449,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 'client_id': client_id,
                 'redirect_uri': redirect_uri,
                 'code_challenge': code_challenge,
+                'code_challenge_method': code_challenge_method,
                 'username': username,
                 'roles': roles,
                 'custom_claims': custom_claims,
@@ -704,9 +733,16 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "jwks_uri": f"{ISSUER}/jwks",
             "device_authorization_endpoint": f"{ISSUER}/device",
             "response_types_supported": ["code", "token", "id_token"],
-            "grant_types_supported": ["authorization_code", "client_credentials", "urn:ietf:params:oauth:grant-type:device_code"],
+            "grant_types_supported": [
+                "authorization_code",
+                "client_credentials",
+                "refresh_token",
+                "urn:ietf:params:oauth:grant-type:device_code",
+            ],
+            "introspection_endpoint": f"{ISSUER}/introspect",
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
+            "code_challenge_methods_supported": ["S256", "plain"],
         }
 
         self.send_response(200)
@@ -726,6 +762,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
         grant_type = params.get('grant_type', [''])[0]
         logger.info(f"Token request from {client_ip} - grant_type: {grant_type}")
+
+        issue_refresh = False
 
         if grant_type == 'authorization_code':
             # Handle authorization code flow
@@ -753,34 +791,28 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "expired_token"}).encode())
                 return
 
-            # Validate PKCE code_verifier
+            # Validate PKCE (RFC 7636) when code_challenge was used at authorize
             code_verifier = params.get('code_verifier', [''])[0]
             stored_challenge = code_data.get('code_challenge', '')
+            stored_method = code_data.get('code_challenge_method', '')
 
-            if stored_challenge and code_verifier:
-                # Compute expected challenge from verifier
-                import hashlib
-                import base64
-                expected_challenge = base64.urlsafe_b64encode(
-                    hashlib.sha256(code_verifier.encode()).digest()
-                ).decode().rstrip('=')
-
-                if expected_challenge != stored_challenge:
-                    logger.error(f"PKCE validation failed from {client_ip}: expected {expected_challenge}, got {stored_challenge}")
+            if stored_challenge:
+                if not code_verifier:
+                    logger.error(f"PKCE validation failed from {client_ip}: missing code_verifier")
                     self.send_response(400)
                     self.send_header('Content-Type', 'application/json')
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
                     return
-            elif stored_challenge:
-                logger.error(f"PKCE validation failed from {client_ip}: missing code_verifier")
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
-                return
+                if not _verify_pkce(stored_challenge, stored_method, code_verifier):
+                    logger.error(f"PKCE validation failed from {client_ip}: verifier does not match challenge")
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
+                    return
 
             # Remove used code
             del AUTH_CODES[code]
@@ -794,6 +826,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             user_roles = code_data.get('roles', [''])
             audience = code_data.get('client_id', CLIENT_ID)
             logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles}")
+            issue_refresh = True
 
         elif grant_type == 'client_credentials':
             # Handle client credentials flow
@@ -886,6 +919,54 @@ class OIDCHandler(BaseHTTPRequestHandler):
             audience = client_id or params.get('client_id', [''])[0] or CLIENT_ID
             logger.info(f"Client credentials token issued for {user_email} from {client_ip} - roles: {user_roles}")
 
+        elif grant_type == 'refresh_token':
+            refresh_token = params.get('refresh_token', [''])[0]
+            client_id = params.get('client_id', [''])[0]
+            if not refresh_token or not client_id:
+                self._send_json_error(400, {"error": "invalid_request", "error_description": "refresh_token and client_id required"})
+                return
+
+            if STRICT_CLIENT_AUTH:
+                auth_header = self.headers.get('Authorization', '')
+                if auth_header.startswith('Basic '):
+                    try:
+                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                        cid, csec = credentials.split(':', 1)
+                        if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                            self._send_json_error(401, {"error": "invalid_client"})
+                            return
+                    except Exception:
+                        self._send_json_error(401, {"error": "invalid_client"})
+                        return
+                else:
+                    cid = params.get('client_id', [''])[0]
+                    csec = params.get('client_secret', [''])[0]
+                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                        self._send_json_error(401, {"error": "invalid_client"})
+                        return
+
+            rec = REFRESH_TOKENS.get(refresh_token)
+            now_rt = datetime.now(timezone.utc)
+            if not rec:
+                logger.error(f"Unknown refresh_token from {client_ip}")
+                self._send_json_error(400, {"error": "invalid_grant"})
+                return
+            if now_rt > rec['expires']:
+                del REFRESH_TOKENS[refresh_token]
+                self._send_json_error(400, {"error": "invalid_grant"})
+                return
+            if rec.get('client_id') != client_id:
+                self._send_json_error(400, {"error": "invalid_grant"})
+                return
+
+            del REFRESH_TOKENS[refresh_token]
+            user_email = rec['user_email']
+            user_roles = rec['user_roles']
+            custom_claims = dict(rec.get('custom_claims') or {})
+            audience = rec.get('audience', CLIENT_ID)
+            logger.info(f"Refresh token exchanged for {user_email} from {client_ip}")
+            issue_refresh = True
+
         elif grant_type == 'urn:ietf:params:oauth:grant-type:device_code':
             # RFC 8628 device authorization grant
             device_code = params.get('device_code', [''])[0]
@@ -957,6 +1038,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             audience = grant.get('client_id', CLIENT_ID)
             DEVICE_GRANTS.pop(device_code, None)
             logger.info(f"Device code exchanged for token for {user_email} from {client_ip}")
+            issue_refresh = True
 
         else:
             logger.error(f"Unsupported grant type from {client_ip}: {grant_type}")
@@ -968,12 +1050,14 @@ class OIDCHandler(BaseHTTPRequestHandler):
             return
         
         # Generate JWT token (id_token/access_token: aud = initiating client_id)
+        now_tok = datetime.now(timezone.utc)
+        ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
         payload = {
             "iss": ISSUER,
             "sub": user_email,
             "aud": audience,
-            "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()),
-            "iat": int(datetime.now(timezone.utc).timestamp()),
+            "exp": int((now_tok + ttl).timestamp()),
+            "iat": int(now_tok.timestamp()),
             "email": user_email,
             ROLES_CLAIM: user_roles,
         }
@@ -992,7 +1076,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             'email': user_email,
             'roles': user_roles,
             'sub': user_email,
-            'expires': datetime.now(timezone.utc) + timedelta(hours=1)
+            'expires': now_tok + ttl
         }
 
         # Add custom claims to token data
@@ -1003,9 +1087,22 @@ class OIDCHandler(BaseHTTPRequestHandler):
         response = {
             "access_token": token,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": ACCESS_TOKEN_TTL_SEC,
             "id_token": token,
         }
+
+        if issue_refresh:
+            rt = secrets.token_urlsafe(48)
+            cc_store = dict(custom_claims) if isinstance(custom_claims, dict) else {}
+            REFRESH_TOKENS[rt] = {
+                'client_id': audience,
+                'audience': audience,
+                'user_email': user_email,
+                'user_roles': user_roles,
+                'custom_claims': cc_store,
+                'expires': now_tok + timedelta(seconds=REFRESH_TOKEN_TTL_SEC),
+            }
+            response["refresh_token"] = rt
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -1096,6 +1193,85 @@ class OIDCHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(jwks).encode())
 
+    def send_introspect(self):
+        """RFC 7662 OAuth 2.0 Token Introspection."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        params = parse_qs(post_data)
+        token = params.get('token', [''])[0]
+        if not token:
+            self._send_json_error(400, {"error": "invalid_request", "error_description": "token required"})
+            return
+
+        if STRICT_CLIENT_AUTH:
+            auth_header = self.headers.get('Authorization', '')
+            if auth_header.startswith('Basic '):
+                try:
+                    credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                    cid, csec = credentials.split(':', 1)
+                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                        self._send_json_error(401, {"error": "invalid_client"})
+                        return
+                except Exception:
+                    self._send_json_error(401, {"error": "invalid_client"})
+                    return
+            else:
+                cid = params.get('client_id', [''])[0]
+                csec = params.get('client_secret', [''])[0]
+                if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                    self._send_json_error(401, {"error": "invalid_client"})
+                    return
+
+        now = datetime.now(timezone.utc)
+
+        if token in REFRESH_TOKENS:
+            rec = REFRESH_TOKENS[token]
+            if now > rec['expires']:
+                body = {"active": False}
+            else:
+                exp = int(rec['expires'].timestamp())
+                cid = rec.get('client_id') or rec.get('audience')
+                body = {
+                    "active": True,
+                    "token_type": "refresh_token",
+                    "client_id": cid,
+                    "username": rec.get('user_email'),
+                    "sub": rec.get('user_email'),
+                    "exp": exp,
+                }
+        else:
+            try:
+                payload = jwt.decode(
+                    token, RSA_PUBLIC_KEY, algorithms=["RS256"],
+                    options={"verify_aud": False}
+                )
+                exp = int(payload.get('exp', 0))
+                if now.timestamp() > exp:
+                    body = {"active": False}
+                else:
+                    aud = payload.get('aud')
+                    if isinstance(aud, list):
+                        aud = aud[0] if aud else None
+                    body = {
+                        "active": True,
+                        "token_type": "access_token",
+                        "client_id": aud,
+                        "username": payload.get('email') or payload.get('sub'),
+                        "sub": payload.get('sub'),
+                        "exp": exp,
+                        "iss": payload.get('iss'),
+                    }
+            except jwt.InvalidTokenError:
+                body = {"active": False}
+
+        logger.info(f"Token introspection from {client_ip} active={body.get('active')}")
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
     def send_test_token(self, path):
         """Generate a test token for a specific user (for testing purposes)"""
         client_ip = self.client_address[0] if self.client_address else 'unknown'
@@ -1123,13 +1299,14 @@ class OIDCHandler(BaseHTTPRequestHandler):
         
         # Generate token with specified groups (aud = client_id from query or default)
         now = datetime.now(timezone.utc)
+        ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
         aud_client = params.get('client_id', [CLIENT_ID])[0] or CLIENT_ID
         payload = {
             "iss": ISSUER,
             "sub": username,
             "aud": aud_client,
             "email": username,
-            "exp": int((now + timedelta(hours=1)).timestamp()),
+            "exp": int((now + ttl).timestamp()),
             "iat": int(now.timestamp()),
             "groups": groups  # OIDC standard claim; use SCIM group IDs
         }
@@ -1143,13 +1320,13 @@ class OIDCHandler(BaseHTTPRequestHandler):
         TOKEN_DATA[token] = {
             'username': username,
             'roles': ["admin", "user", "developer"],
-            'expires': now + timedelta(hours=1)
+            'expires': now + ttl
         }
         
         response = {
             "access_token": token,
             "token_type": "Bearer",
-            "expires_in": 3600
+            "expires_in": ACCESS_TOKEN_TTL_SEC
         }
         
         self.send_response(200)
@@ -1164,6 +1341,7 @@ def cleanup_expired_tokens():
     expired_codes = []
     expired_tokens = []
     expired_devices = []
+    expired_refresh = []
 
     for code, data in AUTH_CODES.items():
         if now > data['expires']:
@@ -1177,6 +1355,10 @@ def cleanup_expired_tokens():
         if now > data['expires']:
             expired_devices.append(device_code)
 
+    for rt, data in REFRESH_TOKENS.items():
+        if now > data['expires']:
+            expired_refresh.append(rt)
+
     for code in expired_codes:
         del AUTH_CODES[code]
 
@@ -1188,10 +1370,13 @@ def cleanup_expired_tokens():
         if grant and grant.get('user_code'):
             USER_CODE_INDEX.pop(_normalize_user_code(grant['user_code']), None)
 
-    if expired_codes or expired_tokens or expired_devices:
+    for rt in expired_refresh:
+        del REFRESH_TOKENS[rt]
+
+    if expired_codes or expired_tokens or expired_devices or expired_refresh:
         logger.info(
             f"Cleaned up {len(expired_codes)} auth codes, {len(expired_tokens)} tokens, "
-            f"{len(expired_devices)} device grants"
+            f"{len(expired_devices)} device grants, {len(expired_refresh)} refresh tokens"
         )
 
 def main():
@@ -1209,6 +1394,7 @@ def main():
     logger.info(f"Token: {ISSUER}/token")
     logger.info(f"UserInfo: {ISSUER}/userinfo")
     logger.info(f"JWKS: {ISSUER}/jwks")
+    logger.info(f"Introspection: {ISSUER}/introspect")
     logger.info(f"Device authorization: {ISSUER}/device")
     logger.info(f"Device verify (browser): {ISSUER}/device/verify")
     logger.info("")

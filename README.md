@@ -7,13 +7,16 @@ A small, standalone OpenID Connect (OIDC) test provider for local development an
 
 ## Features
 
-- **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, supported grant types and algorithms).
+- **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, grant types, **`introspection_endpoint`**, **`code_challenge_methods_supported`** for PKCE).
 - **Signing** — Access and ID tokens are **RS256** JWTs. **`GET /jwks`** exposes the public key with **`x5c`** (self-signed cert by default) so clients that require RS256/x5c can validate remotely.
-- **Authorization code flow** — `GET/POST /authorize` with a browser form to compose **claims** (JSON-backed rows: `sub`, `email`, `groups`, etc.). Redirects with `code`; supports **PKCE** (`code_challenge` / `code_verifier` on token exchange).
+- **Authorization code flow** — `GET/POST /authorize` with a browser form to compose **claims** (JSON-backed rows: `sub`, `email`, `groups`, etc.). Redirects with `code`.
+- **PKCE (RFC 7636)** — Optional on the authorization code flow. Pass **`code_challenge`** (and optionally **`code_challenge_method`**) on `/authorize`; if the challenge is present and the method is omitted, **`S256`** is assumed. Discovery advertises **`S256`** and **`plain`**. Exchange the code at **`POST /token`** with **`code_verifier`** (required when a challenge was used).
 - **Token endpoint** — `POST /token` for:
-  - `grant_type=authorization_code` (optional PKCE)
-  - `grant_type=client_credentials`
-  - `grant_type=urn:ietf:params:oauth:grant-type:device_code` (**RFC 8628** device flow)
+  - `grant_type=authorization_code` (with optional PKCE as above); returns **`refresh_token`** for rotating sessions
+  - `grant_type=refresh_token` — exchange a refresh token for new access + ID tokens and a **new** refresh token (rotation)
+  - `grant_type=client_credentials` (no refresh token)
+  - `grant_type=urn:ietf:params:oauth:grant-type:device_code` (**RFC 8628** device flow; includes refresh token)
+- **Token introspection (RFC 7662)** — `POST /introspect` with `token` and client authentication (`client_id` / `client_secret` when strict auth is on). Returns **`active`** (boolean) for access tokens (JWT) and refresh tokens (opaque), plus **`token_type`**, **`client_id`**, **`sub`**, **`exp`**, etc.
 - **Device authorization (RFC 8628)** — `POST /device` returns `device_code`, `user_code`, and verification URLs. User completes sign-in at **`GET/POST /device/verify`** (same claims UX as authorize). The client polls **`POST /token`** until approval or expiry.
 - **UserInfo** — `GET /userinfo` with `Authorization: Bearer <access_token>`.
 - **Quick test tokens** — `GET /test-token/{user}?groups=...&client_id=...` for scripted tests.
@@ -57,10 +60,27 @@ python -c "from app import provider; provider.main()"
   - Open: `http://localhost:8888/authorize?client_id=test-client&redirect_uri=https://example.com/cb&response_type=code&state=xyz`
   - Edit claims in the form and submit; you are redirected to `redirect_uri?code=...&state=...`
 
-- **Exchange code for tokens:**
+- **Exchange code for tokens** (response includes `refresh_token` when using the authorization or device code flows):
   ```bash
   curl -s -X POST http://localhost:8888/token \
     -d grant_type=authorization_code -d code=<CODE> -d redirect_uri=https://example.com/cb
+  ```
+
+- **Refresh access token** (rotation — old refresh token is invalidated):
+  ```bash
+  curl -s -X POST http://localhost:8888/token \
+    -d grant_type=refresh_token \
+    -d refresh_token=<REFRESH_TOKEN> \
+    -d client_id=test-client \
+    -d client_secret=test-secret
+  ```
+
+- **Introspect a token** (RFC 7662):
+  ```bash
+  curl -s -X POST http://localhost:8888/introspect \
+    -d token=<ACCESS_OR_REFRESH_TOKEN> \
+    -d client_id=test-client \
+    -d client_secret=test-secret | jq
   ```
 
 - **Device flow** (RFC 8628) — outline:
@@ -162,6 +182,8 @@ Defaults apply when a variable is unset.
 | `OIDC_X509_CERT` | *(self-signed)* | Path to PEM or PEM string of the certificate for **`x5c`** in JWKS. If unset, a self-signed cert is generated with the private key. |
 | `DEVICE_POLL_INTERVAL` | `5` | Minimum seconds between token polls for the device grant; responses may include `slow_down`. Set to `0` to disable the slow-down check (e.g. tests). |
 | `DEVICE_EXPIRES_SEC` | `600` | Lifetime (seconds) of a device authorization session. |
+| `ACCESS_TOKEN_TTL_SEC` | `3600` | Access / ID token lifetime in seconds (`exp`, `expires_in`, and `/userinfo` validation). |
+| `REFRESH_TOKEN_TTL_SEC` | `604800` (7 days) | Refresh token lifetime for authorization code and device code flows. |
 
 **Notes**
 

@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import secrets
 import threading
 import time
 import urllib.parse
@@ -18,6 +21,7 @@ def running_server():
     provider.TOKEN_DATA.clear()
     provider.DEVICE_GRANTS.clear()
     provider.USER_CODE_INDEX.clear()
+    provider.REFRESH_TOKENS.clear()
     provider.DEVICE_POLL_INTERVAL = 0  # skip slow_down between polls in tests
 
     server = HTTPServer(('127.0.0.1', 0), provider.OIDCHandler)
@@ -49,6 +53,9 @@ def test_discovery_and_jwks(running_server):
     assert 'token_endpoint' in doc
     assert doc.get('device_authorization_endpoint') == f"{provider.ISSUER}/device"
     assert 'urn:ietf:params:oauth:grant-type:device_code' in doc.get('grant_types_supported', [])
+    assert doc.get('code_challenge_methods_supported') == ['S256', 'plain']
+    assert doc.get('introspection_endpoint') == f"{provider.ISSUER}/introspect"
+    assert 'refresh_token' in doc.get('grant_types_supported', [])
 
     # JWKS: RS256 key with x5c (client expects RS256/x5c)
     r = requests.get(f"{base}/jwks")
@@ -63,6 +70,73 @@ def test_discovery_and_jwks(running_server):
     assert 'n' in key and 'e' in key
     assert 'x5c' in key
     assert len(key['x5c']) >= 1
+
+
+def test_pkce_authorization_code_s256(running_server):
+    base = running_server
+    redirect_uri = 'https://example.com/callback'
+    state = 'pkce-state'
+    code_verifier = secrets.token_urlsafe(32)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip('=')
+
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'state': state,
+            'code_challenge': code_challenge,
+            'code_challenge_method': 'S256',
+        },
+    )
+    assert r.status_code == 200
+
+    data = {
+        'username': 'pkce-user',
+        'roles': 'admin',
+        'client_id': provider.CLIENT_ID,
+        'redirect_uri': redirect_uri,
+        'state': state,
+        'response_type': 'code',
+        'code_challenge': code_challenge,
+        'code_challenge_method': 'S256',
+    }
+    r = requests.post(f"{base}/authorize", data=data, allow_redirects=False)
+    assert r.status_code == 302
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers['Location']).query)
+    code = q['code'][0]
+
+    bad = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': redirect_uri,
+            'code_verifier': 'wrong-verifier',
+        },
+    )
+    assert bad.status_code == 400
+    assert bad.json().get('error') == 'invalid_grant'
+
+    token_resp = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': redirect_uri,
+            'code_verifier': code_verifier,
+        },
+    )
+    assert token_resp.status_code == 200
+    access_token = token_resp.json()['access_token']
+    decoded = jwt.decode(
+        access_token, provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience=provider.CLIENT_ID,
+    )
+    assert decoded.get('sub') == 'pkce-user'
 
 
 def test_authorization_code_flow_and_userinfo(running_server):
@@ -223,4 +297,111 @@ def test_device_code_flow(running_server):
     )
     assert decoded.get("sub") == "devuser"
     assert decoded.get("aud") == provider.CLIENT_ID
+
+
+def test_refresh_token_and_introspection(running_server):
+    base = running_server
+    redirect_uri = 'https://example.com/callback'
+    state = 'rt-state'
+
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'state': state,
+        },
+    )
+    assert r.status_code == 200
+
+    r = requests.post(
+        f"{base}/authorize",
+        data={
+            'username': 'refresh-user',
+            'roles': 'admin',
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'state': state,
+            'response_type': 'code',
+        },
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    code = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers['Location']).query)['code'][0]
+
+    tok = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': redirect_uri,
+        },
+    )
+    assert tok.status_code == 200
+    body = tok.json()
+    assert 'refresh_token' in body
+    access_token = body['access_token']
+    refresh_token = body['refresh_token']
+
+    intro_a = requests.post(
+        f"{base}/introspect",
+        data={
+            'token': access_token,
+            'client_id': provider.CLIENT_ID,
+            'client_secret': provider.CLIENT_SECRET,
+        },
+    )
+    assert intro_a.status_code == 200
+    ja = intro_a.json()
+    assert ja.get('active') is True
+    assert ja.get('token_type') == 'access_token'
+    assert ja.get('client_id') == provider.CLIENT_ID
+
+    intro_r = requests.post(
+        f"{base}/introspect",
+        data={
+            'token': refresh_token,
+            'client_id': provider.CLIENT_ID,
+            'client_secret': provider.CLIENT_SECRET,
+        },
+    )
+    assert intro_r.json().get('active') is True
+    assert intro_r.json().get('token_type') == 'refresh_token'
+
+    intro_bad = requests.post(
+        f"{base}/introspect",
+        data={
+            'token': 'not-a-valid-token',
+            'client_id': provider.CLIENT_ID,
+            'client_secret': provider.CLIENT_SECRET,
+        },
+    )
+    assert intro_bad.json().get('active') is False
+
+    refreshed = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+            'client_id': provider.CLIENT_ID,
+            'client_secret': provider.CLIENT_SECRET,
+        },
+    )
+    assert refreshed.status_code == 200
+    body2 = refreshed.json()
+    assert body2['refresh_token'] != refresh_token
+    assert 'access_token' in body2
+
+    stale = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+            'client_id': provider.CLIENT_ID,
+            'client_secret': provider.CLIENT_SECRET,
+        },
+    )
+    assert stale.status_code == 400
+    assert stale.json().get('error') == 'invalid_grant'
 
