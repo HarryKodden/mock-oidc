@@ -16,6 +16,9 @@ from app import provider
 def running_server():
     provider.AUTH_CODES.clear()
     provider.TOKEN_DATA.clear()
+    provider.DEVICE_GRANTS.clear()
+    provider.USER_CODE_INDEX.clear()
+    provider.DEVICE_POLL_INTERVAL = 0  # skip slow_down between polls in tests
 
     server = HTTPServer(('127.0.0.1', 0), provider.OIDCHandler)
     port = server.server_address[1]
@@ -44,6 +47,8 @@ def test_discovery_and_jwks(running_server):
     doc = r.json()
     assert doc.get('issuer') == provider.ISSUER
     assert 'token_endpoint' in doc
+    assert doc.get('device_authorization_endpoint') == f"{provider.ISSUER}/device"
+    assert 'urn:ietf:params:oauth:grant-type:device_code' in doc.get('grant_types_supported', [])
 
     # JWKS: RS256 key with x5c (client expects RS256/x5c)
     r = requests.get(f"{base}/jwks")
@@ -168,4 +173,54 @@ def test_test_token_endpoint(running_server):
     )
     assert decoded2.get('aud') == 'my-app'
     assert decoded2.get('sub') == 'carol'
+
+
+def test_device_code_flow(running_server):
+    base = running_server
+
+    r = requests.post(
+        f"{base}/device",
+        data={"client_id": provider.CLIENT_ID, "client_secret": provider.CLIENT_SECRET},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    device_code = body["device_code"]
+    user_code = body["user_code"]
+    assert body.get("verification_uri") == f"{base}/device/verify"
+    assert "user_code=" in body.get("verification_uri_complete", "")
+
+    pending = requests.post(
+        f"{base}/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+            "client_id": provider.CLIENT_ID,
+            "client_secret": provider.CLIENT_SECRET,
+        },
+    )
+    assert pending.status_code == 400
+    assert pending.json().get("error") == "authorization_pending"
+
+    ok = requests.post(
+        f"{base}/device/verify",
+        data={"user_code": user_code, "username": "devuser", "roles": "admin,dev"},
+    )
+    assert ok.status_code == 200
+
+    token_resp = requests.post(
+        f"{base}/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": device_code,
+            "client_id": provider.CLIENT_ID,
+            "client_secret": provider.CLIENT_SECRET,
+        },
+    )
+    assert token_resp.status_code == 200
+    access = token_resp.json()["access_token"]
+    decoded = jwt.decode(
+        access, provider.RSA_PUBLIC_KEY, algorithms=["RS256"], audience=provider.CLIENT_ID
+    )
+    assert decoded.get("sub") == "devuser"
+    assert decoded.get("aud") == provider.CLIENT_ID
 

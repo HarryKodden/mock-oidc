@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Device sign-in - OIDC Provider</title>
+  <link rel="stylesheet" href="{{ base_path }}/static/styles.css">
+</head>
+<body>
+  <div class="login-container">
+    <h1>📱 Authorize device</h1>
+    <p class="subtitle">RFC 8628 — enter the code shown on your device, then your claims</p>
+    <form method="POST" action="{{ base_path }}/device/verify" id="deviceForm">
+      <div class="form-group">
+        <label for="user_code">User code</label>
+        <input type="text" id="user_code" name="user_code" value="{{ user_code_prefill }}" placeholder="XXXX-XXXX" required autocomplete="off" autocapitalize="characters">
+      </div>
+
+      <input type="hidden" id="userinfo" name="userinfo">
+
+      <div class="form-group">
+        <label>Claims</label>
+        <div id="claimsContainer"></div>
+        <div style="margin-top:8px">
+          <button type="button" id="addClaim">+ Add claim</button>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit">Authorize</button>
+      </div>
+    </form>
+
+    <div class="info-box">
+      <strong>Test Provider:</strong> Same claim editor as <code>/authorize</code>. Submitting approves the pending device grant.
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      const form = document.getElementById('deviceForm');
+      const container = document.getElementById('claimsContainer');
+      const hidden = document.getElementById('userinfo');
+      const addBtn = document.getElementById('addClaim');
+
+      let initial = null;
+      try {
+        initial = {{ saved_userinfo|tojson if saved_userinfo else 'null' }};
+      } catch (e) { initial = null; }
+      if (typeof initial === 'string' && initial) {
+        try { initial = JSON.parse(initial); } catch (e) { initial = null; }
+      }
+      if (!initial) {
+        try { initial = JSON.parse('{"sub":"user@example.com","email":"user@example.com","groups":["developer"]}'); } catch(e){ initial = {} }
+      }
+
+      function toDisplayValue(v) {
+        if (Array.isArray(v) || typeof v === 'object') return JSON.stringify(v);
+        return String(v);
+      }
+
+      function renderRows(obj){
+        container.innerHTML = '';
+        const keys = Object.keys(obj || {});
+        const ordered = [];
+        if (keys.includes('sub')) ordered.push('sub');
+        if (keys.includes('email')) ordered.push('email');
+        keys.forEach(function(k){ if (k !== 'sub' && k !== 'email') ordered.push(k); });
+        ordered.forEach(function(key){ addRow(key, toDisplayValue(obj[key])); });
+        validateAllKeys();
+      }
+
+      function addRow(key='', value=''){
+        const row = document.createElement('div');
+        row.className = 'claim-row';
+        row.style.marginTop = '8px';
+        row.style.display = 'grid';
+        row.style.gridTemplateColumns = '140px 1fr 40px';
+        row.style.gridColumnGap = '8px';
+        row.style.alignItems = 'center';
+        const err = document.createElement('div');
+        err.style.color = '#ef4444';
+        err.style.fontSize = '12px';
+        err.style.marginTop = '4px';
+        err.style.gridColumn = '1 / span 3';
+        err.style.display = 'none';
+
+        const k = document.createElement('input');
+        k.type = 'text'; k.placeholder = 'claim name'; k.value = key; k.style.width = '100%'; k.style.boxSizing = 'border-box';
+        const v = document.createElement('input');
+        v.type = 'text'; v.placeholder = 'value (plain or JSON)'; v.value = value; v.style.width = '100%'; v.style.boxSizing = 'border-box';
+        const rem = document.createElement('button');
+        rem.type = 'button'; rem.textContent = '✕'; rem.style.color = '#ef4444';
+        rem.addEventListener('click', function(){ container.removeChild(row); validateAllKeys(); });
+        if (key === 'sub' || key === 'email') {
+          k.readOnly = true;
+          rem.style.visibility = 'hidden'; rem.disabled = true;
+        } else {
+          k.addEventListener('input', validateAllKeys);
+        }
+        row.appendChild(k); row.appendChild(v); row.appendChild(rem); row.appendChild(err);
+        container.appendChild(row);
+        validateAllKeys();
+      }
+
+      addBtn.addEventListener('click', function(){ addRow(); });
+      renderRows(initial);
+
+      function validateAllKeys(){
+        const submitBtn = document.querySelector('button[type=submit]');
+        const rows = container.querySelectorAll('.claim-row');
+        const counts = {};
+        rows.forEach(function(row){
+          const k = (row.children[0].value || '').trim();
+          if (!k) return;
+          counts[k] = (counts[k] || 0) + 1;
+        });
+        let invalid = false;
+        rows.forEach(function(row){
+          const keyInput = row.children[0];
+          const valInput = row.children[1];
+          const errDiv = row.children[3];
+          const k = (keyInput.value || '').trim();
+          const v = (valInput.value || '').trim();
+          if (!k) { invalid = true; return; }
+          if (counts[k] > 1) { errDiv.textContent = 'Duplicate'; errDiv.style.display = 'block'; invalid = true; return; }
+          if ((k === 'sub' || k === 'email') && !v) { invalid = true; return; }
+          errDiv.style.display = 'none';
+        });
+        submitBtn.disabled = invalid;
+      }
+
+      form.addEventListener('submit', function(){
+        const out = {};
+        container.querySelectorAll('.claim-row').forEach(function(row){
+          const key = (row.children[0].value || '').trim();
+          let val = (row.children[1].value || '').trim();
+          if (!key) return;
+          try { val = JSON.parse(val); } catch (e) {}
+          out[key] = val;
+        });
+        hidden.value = JSON.stringify(out);
+      });
+    })();
+  </script>
+</body>
+</html>

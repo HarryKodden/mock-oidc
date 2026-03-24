@@ -8,6 +8,7 @@ The gateway can then validate tokens against this server.
 
 import base64
 import json
+import re
 import uuid
 import jwt
 import os
@@ -48,6 +49,23 @@ if BASE_PATH:
         BASE_PATH = '/' + BASE_PATH
     if BASE_PATH.endswith('/') and BASE_PATH != '/':
         BASE_PATH = BASE_PATH.rstrip('/')
+
+# RFC 8628 device flow: poll interval (seconds); set to 0 in tests to skip slow_down
+DEVICE_POLL_INTERVAL = int(os.getenv('DEVICE_POLL_INTERVAL', '5'))
+DEVICE_EXPIRES_SEC = int(os.getenv('DEVICE_EXPIRES_SEC', '600'))
+
+
+def _normalize_user_code(code: str) -> str:
+    """Normalize user code for lookup (case-insensitive, ignore hyphen/spaces)."""
+    return re.sub(r'[\s-]+', '', (code or '').upper())
+
+
+def _generate_user_code() -> str:
+    """Human-readable user code (RFC 8628-style unambiguous charset)."""
+    alphabet = 'BCDFGHJKLMNPQRSTVWXZ2356789'
+    a = ''.join(secrets.choice(alphabet) for _ in range(4))
+    b = ''.join(secrets.choice(alphabet) for _ in range(4))
+    return f'{a}-{b}'
 
 
 def _int_to_base64url(i: int) -> str:
@@ -131,6 +149,10 @@ JWT_KEY_ID = JWKS_KEYS[0]["kid"] if JWKS_KEYS else "mock-oidc-rs256"
 AUTH_CODES = {}
 # Store access token data (username, roles) for /userinfo endpoint
 TOKEN_DATA = {}
+# RFC 8628 device authorization: device_code -> grant record
+DEVICE_GRANTS = {}
+# normalized user_code -> device_code (pending grants only)
+USER_CODE_INDEX = {}
 
 # Jinja2 templates environment
 _TEMPLATE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
@@ -213,6 +235,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_userinfo()
         elif parsed_path.path == '/jwks':
             self.send_jwks()
+        elif parsed_path.path == '/device/verify':
+            self.handle_device_verify_get()
         elif parsed_path.path.startswith('/test-token/'):
             # pass the full request path (including query string) so send_test_token
             # can parse query params correctly; translate path to routed form
@@ -247,6 +271,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_token()
         elif parsed_path.path == '/authorize':
             self.handle_authorize_post()
+        elif parsed_path.path == '/device':
+            self.send_device_authorization()
+        elif parsed_path.path == '/device/verify':
+            self.handle_device_verify_post()
         else:
             logger.warning(f"404 Not Found: {parsed_path.path} from {client_ip}")
             self.send_response(404)
@@ -434,6 +462,234 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "username_required"}).encode())
                 return
+
+    def _send_json_error(self, status: int, body: dict):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def send_device_authorization(self):
+        """RFC 8628: POST /device — issue device_code and user_code."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        params = parse_qs(post_data)
+        client_id = params.get('client_id', [''])[0]
+        if not client_id:
+            logger.error(f"Device authorization missing client_id from {client_ip}")
+            self._send_json_error(400, {"error": "invalid_request", "error_description": "client_id required"})
+            return
+
+        if STRICT_CLIENT_AUTH:
+            auth_header = self.headers.get('Authorization', '')
+            if auth_header.startswith('Basic '):
+                try:
+                    credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                    cid, csec = credentials.split(':', 1)
+                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                        self._send_json_error(401, {"error": "invalid_client"})
+                        return
+                except Exception:
+                    self._send_json_error(401, {"error": "invalid_client"})
+                    return
+            else:
+                cid = params.get('client_id', [''])[0]
+                csec = params.get('client_secret', [''])[0]
+                if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                    self._send_json_error(401, {"error": "invalid_client"})
+                    return
+
+        user_code = None
+        for _ in range(32):
+            candidate = _generate_user_code()
+            norm = _normalize_user_code(candidate)
+            if norm not in USER_CODE_INDEX:
+                user_code = candidate
+                break
+        if not user_code:
+            logger.error(f"Could not allocate user_code from {client_ip}")
+            self._send_json_error(500, {"error": "server_error"})
+            return
+
+        device_code = secrets.token_urlsafe(48)
+        expires = datetime.now(timezone.utc) + timedelta(seconds=DEVICE_EXPIRES_SEC)
+        poll_iv = DEVICE_POLL_INTERVAL if DEVICE_POLL_INTERVAL > 0 else 5
+
+        DEVICE_GRANTS[device_code] = {
+            'user_code': user_code,
+            'client_id': client_id,
+            'scope': params.get('scope', [''])[0],
+            'expires': expires,
+            'interval': DEVICE_POLL_INTERVAL,
+            'last_poll_at': None,
+            'status': 'pending',
+            'username': None,
+            'roles': [],
+            'custom_claims': {},
+        }
+        USER_CODE_INDEX[_normalize_user_code(user_code)] = device_code
+
+        verification_uri = f"{ISSUER}/device/verify"
+        verification_uri_complete = f"{verification_uri}?user_code={quote(user_code)}"
+        body = {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": verification_uri,
+            "verification_uri_complete": verification_uri_complete,
+            "expires_in": DEVICE_EXPIRES_SEC,
+            "interval": poll_iv,
+        }
+        logger.info(f"Device authorization issued to {client_ip} user_code={user_code}")
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def handle_device_verify_get(self):
+        """Browser: show verification form (RFC 8628 user interaction)."""
+        parsed_path = urlparse(self.path)
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        params = parse_qs(parsed_path.query)
+        user_code_prefill = params.get('user_code', [''])[0]
+
+        saved_userinfo = None
+        cookie_header = self.headers.get('Cookie', '')
+        if cookie_header:
+            for part in cookie_header.split(';'):
+                kv = part.strip()
+                if kv.startswith('mock_oidc_userinfo='):
+                    try:
+                        cookie_val = unquote(kv.split('=', 1)[1])
+                        try:
+                            parsed = json.loads(cookie_val)
+                            if isinstance(parsed, dict):
+                                saved_userinfo = parsed
+                        except Exception:
+                            saved_userinfo = None
+                    except Exception:
+                        saved_userinfo = None
+                    break
+
+        if not saved_userinfo:
+            saved_userinfo = {
+                'sub': str(uuid.uuid4()),
+                'email': 'user@example.com',
+                'groups': ['developer']
+            }
+
+        try:
+            template = TEMPLATES.get_template('device.html')
+            html = template.render(
+                base_path=BASE_PATH,
+                user_code_prefill=user_code_prefill,
+                saved_userinfo=saved_userinfo,
+            )
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(html.encode())
+        except Exception as e:
+            logger.exception("Failed to render device.html")
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>device verify error</body></html>")
+
+    def handle_device_verify_post(self):
+        """Approve a pending device grant after user signs in."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        post_params = parse_qs(post_data)
+
+        raw_code = post_params.get('user_code', [''])[0]
+        norm = _normalize_user_code(raw_code)
+        device_code = USER_CODE_INDEX.get(norm)
+        if not device_code or device_code not in DEVICE_GRANTS:
+            logger.warning(f"Device verify unknown user_code from {client_ip}")
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Invalid or expired user code.</body></html>")
+            return
+
+        grant = DEVICE_GRANTS[device_code]
+        if datetime.now(timezone.utc) > grant['expires']:
+            del USER_CODE_INDEX[norm]
+            del DEVICE_GRANTS[device_code]
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Invalid or expired user code.</body></html>")
+            return
+
+        if grant['status'] != 'pending':
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>This code was already used.</body></html>")
+            return
+
+        userinfo_text = post_params.get('userinfo', [''])[0]
+        username = ''
+        roles = []
+        custom_claims = {}
+
+        if userinfo_text:
+            try:
+                parsed = json.loads(userinfo_text)
+                if isinstance(parsed, dict):
+                    custom_claims = parsed.copy()
+                    username = parsed.get('email') or parsed.get('sub') or ''
+                    groups = parsed.get('groups') or parsed.get('roles')
+                    if isinstance(groups, list):
+                        roles = groups
+                    elif isinstance(groups, str):
+                        roles = [g.strip() for g in groups.split(',') if g.strip()]
+            except Exception as e:
+                logger.warning(f"Failed to parse userinfo JSON from {client_ip}: {e}")
+
+        if not userinfo_text:
+            username = post_params.get('username', [''])[0]
+            roles_input = post_params.get('roles', ['admin'])[0]
+            roles = [role.strip() for role in roles_input.split(',') if role.strip()]
+            if not roles:
+                roles = ['user']
+
+        if not username:
+            self.send_response(401)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Username / claims required.</body></html>")
+            return
+
+        grant['status'] = 'approved'
+        grant['username'] = username
+        grant['roles'] = roles
+        grant['custom_claims'] = custom_claims
+        del USER_CODE_INDEX[norm]
+
+        try:
+            cookie_value = quote(json.dumps(custom_claims)) if custom_claims else quote(json.dumps({"sub": username, "email": username, "groups": roles}))
+            cookie_path = BASE_PATH or '/'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Set-Cookie', f"mock_oidc_userinfo={cookie_value}; Path={cookie_path}; HttpOnly; SameSite=Lax")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><p>Device authorized. You may close this window.</p></body></html>"
+            )
+        except Exception:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><p>Device authorized. You may close this window.</p></body></html>"
+            )
+        logger.info(f"Device grant approved for user {username} from {client_ip}")
     
     def send_discovery_document(self):
         """Send OpenID Connect discovery document"""
@@ -446,8 +702,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "token_endpoint": f"{ISSUER}/token",
             "userinfo_endpoint": f"{ISSUER}/userinfo",
             "jwks_uri": f"{ISSUER}/jwks",
+            "device_authorization_endpoint": f"{ISSUER}/device",
             "response_types_supported": ["code", "token", "id_token"],
-            "grant_types_supported": ["authorization_code", "client_credentials"],
+            "grant_types_supported": ["authorization_code", "client_credentials", "urn:ietf:params:oauth:grant-type:device_code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
         }
@@ -628,6 +885,78 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
             audience = client_id or params.get('client_id', [''])[0] or CLIENT_ID
             logger.info(f"Client credentials token issued for {user_email} from {client_ip} - roles: {user_roles}")
+
+        elif grant_type == 'urn:ietf:params:oauth:grant-type:device_code':
+            # RFC 8628 device authorization grant
+            device_code = params.get('device_code', [''])[0]
+            client_id = params.get('client_id', [''])[0]
+            if not device_code or not client_id:
+                self._send_json_error(400, {"error": "invalid_request", "error_description": "device_code and client_id required"})
+                return
+
+            if STRICT_CLIENT_AUTH:
+                auth_header = self.headers.get('Authorization', '')
+                if auth_header.startswith('Basic '):
+                    try:
+                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                        cid, csec = credentials.split(':', 1)
+                        if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                            self._send_json_error(401, {"error": "invalid_client"})
+                            return
+                    except Exception:
+                        self._send_json_error(401, {"error": "invalid_client"})
+                        return
+                else:
+                    cid = params.get('client_id', [''])[0]
+                    csec = params.get('client_secret', [''])[0]
+                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
+                        self._send_json_error(401, {"error": "invalid_client"})
+                        return
+
+            grant = DEVICE_GRANTS.get(device_code)
+            if not grant:
+                logger.error(f"Unknown device_code from {client_ip}")
+                self._send_json_error(400, {"error": "invalid_grant"})
+                return
+
+            now = datetime.now(timezone.utc)
+            if now > grant['expires']:
+                DEVICE_GRANTS.pop(device_code, None)
+                uc = grant.get('user_code', '')
+                if uc:
+                    USER_CODE_INDEX.pop(_normalize_user_code(uc), None)
+                self._send_json_error(400, {"error": "expired_token", "error_description": "device session expired"})
+                return
+
+            if grant.get('client_id') != client_id:
+                self._send_json_error(400, {"error": "invalid_grant"})
+                return
+
+            poll_iv = grant.get('interval', DEVICE_POLL_INTERVAL)
+            if poll_iv and poll_iv > 0 and grant.get('last_poll_at') is not None:
+                delta = (now - grant['last_poll_at']).total_seconds()
+                if delta < poll_iv:
+                    self._send_json_error(400, {"error": "slow_down", "error_description": "polling too frequently"})
+                    return
+            grant['last_poll_at'] = now
+
+            if grant['status'] == 'pending':
+                self._send_json_error(400, {"error": "authorization_pending", "error_description": "user has not yet completed authorization"})
+                return
+            if grant['status'] == 'denied':
+                DEVICE_GRANTS.pop(device_code, None)
+                self._send_json_error(400, {"error": "access_denied"})
+                return
+
+            # approved
+            custom_claims = grant.get('custom_claims', {}) or {}
+            user_email = grant.get('username', '')
+            if isinstance(custom_claims, dict):
+                user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
+            user_roles = grant.get('roles', [''])
+            audience = grant.get('client_id', CLIENT_ID)
+            DEVICE_GRANTS.pop(device_code, None)
+            logger.info(f"Device code exchanged for token for {user_email} from {client_ip}")
 
         else:
             logger.error(f"Unsupported grant type from {client_ip}: {grant_type}")
@@ -834,6 +1163,7 @@ def cleanup_expired_tokens():
     now = datetime.now(timezone.utc)
     expired_codes = []
     expired_tokens = []
+    expired_devices = []
 
     for code, data in AUTH_CODES.items():
         if now > data['expires']:
@@ -843,14 +1173,26 @@ def cleanup_expired_tokens():
         if now > data['expires']:
             expired_tokens.append(token)
 
+    for device_code, data in DEVICE_GRANTS.items():
+        if now > data['expires']:
+            expired_devices.append(device_code)
+
     for code in expired_codes:
         del AUTH_CODES[code]
 
     for token in expired_tokens:
         del TOKEN_DATA[token]
 
-    if expired_codes or expired_tokens:
-        logger.info(f"Cleaned up {len(expired_codes)} expired auth codes and {len(expired_tokens)} expired tokens")
+    for device_code in expired_devices:
+        grant = DEVICE_GRANTS.pop(device_code, None)
+        if grant and grant.get('user_code'):
+            USER_CODE_INDEX.pop(_normalize_user_code(grant['user_code']), None)
+
+    if expired_codes or expired_tokens or expired_devices:
+        logger.info(
+            f"Cleaned up {len(expired_codes)} auth codes, {len(expired_tokens)} tokens, "
+            f"{len(expired_devices)} device grants"
+        )
 
 def main():
     """Start the OIDC Provider server"""
@@ -867,6 +1209,8 @@ def main():
     logger.info(f"Token: {ISSUER}/token")
     logger.info(f"UserInfo: {ISSUER}/userinfo")
     logger.info(f"JWKS: {ISSUER}/jwks")
+    logger.info(f"Device authorization: {ISSUER}/device")
+    logger.info(f"Device verify (browser): {ISSUER}/device/verify")
     logger.info("")
     logger.info("Configure your .env with:")
     logger.info(f"  ISSUER={ISSUER}")
