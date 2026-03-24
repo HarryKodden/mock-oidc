@@ -466,3 +466,37 @@ def test_root_callback_uri_and_oauth_callback_page(running_server):
     assert r2.status_code == 200
     assert "callback-user" in r2.text or "access_token" in r2.text
 
+
+def test_public_url_ignores_hostname_misconfigured_base_path():
+    """BASE_PATH must be a path (e.g. /oidc), not the host name."""
+    orig_issuer, orig_bp = provider.ISSUER, provider.BASE_PATH
+    try:
+        provider.ISSUER = "https://oidc.apps.fried-air.com"
+        provider.BASE_PATH = "/oidc.apps.fried-air.com"
+        assert provider.public_url("/callback") == "https://oidc.apps.fried-air.com/callback"
+    finally:
+        provider.ISSUER = orig_issuer
+        provider.BASE_PATH = orig_bp
+
+
+def test_public_url_no_duplicate_when_issuer_includes_mount_path():
+    orig_issuer, orig_bp = provider.ISSUER, provider.BASE_PATH
+    try:
+        provider.ISSUER = "https://oidc.apps.fried-air.com/oidc"
+        provider.BASE_PATH = "/oidc"
+        assert provider.public_url("/callback") == "https://oidc.apps.fried-air.com/oidc/callback"
+    finally:
+        provider.ISSUER = orig_issuer
+        provider.BASE_PATH = orig_bp
+
+
+def test_public_url_mount_path_only_on_base_path():
+    orig_issuer, orig_bp = provider.ISSUER, provider.BASE_PATH
+    try:
+        provider.ISSUER = "https://oidc.apps.fried-air.com"
+        provider.BASE_PATH = "/oidc"
+        assert provider.public_url("/callback") == "https://oidc.apps.fried-air.com/oidc/callback"
+    finally:
+        provider.ISSUER = orig_issuer
+        provider.BASE_PATH = orig_bp
+

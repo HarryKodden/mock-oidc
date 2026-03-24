@@ -189,7 +189,7 @@ Defaults apply when a variable is unset.
 | `CLIENT_SECRET` | `test-secret` | Client secret for strict auth and confidential flows. |
 | `ROLES_CLAIM` | `groups` | Claim name used for roles/groups in tokens and `/userinfo`. |
 | `STRICT_CLIENT_AUTH` | `true` | If true, `client_id` / `client_secret` must match `CLIENT_ID` / `CLIENT_SECRET` where applicable. Use `false` for permissive local testing. |
-| `BASE_PATH` | *(empty)* | Mount path prefix when served behind a reverse proxy (leading slash, no trailing slash except `/`). |
+| `BASE_PATH` | *(empty)* | **Path** prefix when the app is mounted under a URL path (e.g. `/oidc`), not the hostname. Must not duplicate a path already included in **`ISSUER`**. If you mistakenly set this to your host name (e.g. `oidc.apps.fried-air.com`), it is ignored for generated URLs and a warning is logged. |
 | `OIDC_RSA_PRIVATE_KEY` | *(generate)* | Path to PEM file or PEM string of the RSA **private** key used to sign JWTs. If unset, a key is generated at startup (not stable across restarts). |
 | `OIDC_X509_CERT` | *(self-signed)* | Path to PEM or PEM string of the certificate for **`x5c`** in JWKS. If unset, a self-signed cert is generated with the private key. |
 | `DEVICE_POLL_INTERVAL` | `5` | Minimum seconds between token polls for the device grant; responses may include `slow_down`. Set to `0` to disable the slow-down check (e.g. tests). |

@@ -53,10 +53,50 @@ if BASE_PATH:
         BASE_PATH = BASE_PATH.rstrip('/')
 
 
+def _looks_like_hostname_only_segment(s: str) -> bool:
+    """
+    True if s looks like a DNS hostname (not a URL path segment like v1.0).
+    Used to detect BASE_PATH mis-set to the host name instead of a mount path.
+    """
+    s = (s or '').strip().strip('/')
+    if not s or '/' in s:
+        return False
+    # Require a TLD of 2+ letters so "v1.0" is not treated as a hostname
+    return bool(re.match(
+        r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$',
+        s,
+    ))
+
+
+def _effective_base_path() -> str:
+    """BASE_PATH for URL building; empty if unset or mis-set (hostname instead of path)."""
+    if not BASE_PATH:
+        return ''
+    inner = BASE_PATH.strip('/')
+    if _looks_like_hostname_only_segment(inner):
+        logger.warning(
+            "BASE_PATH=%r looks like a hostname, not a mount path (e.g. /oidc). "
+            "Ignoring BASE_PATH for URLs. Set ISSUER to the full public URL and "
+            "BASE_PATH only when the app is under a subpath.",
+            BASE_PATH,
+        )
+        return ''
+    return BASE_PATH
+
+
 def public_url(path: str) -> str:
     """Absolute URL for this service (issuer + optional base path + path)."""
     p = path if path.startswith('/') else '/' + path
-    return ISSUER.rstrip('/') + (BASE_PATH or '') + p
+    base = _effective_base_path()
+    issuer_norm = ISSUER.rstrip('/')
+    parsed = urlparse(issuer_norm)
+    issuer_path = (parsed.path or '').rstrip('/')
+    # If ISSUER already includes the mount path, do not append BASE_PATH again
+    if base:
+        b = base.rstrip('/')
+        if issuer_path.endswith(b) or issuer_path == b:
+            base = ''
+    return issuer_norm + base + p
 
 
 def oauth_callback_uri() -> str:
@@ -679,7 +719,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
         }
         USER_CODE_INDEX[_normalize_user_code(user_code)] = device_code
 
-        verification_uri = f"{ISSUER}/device/verify"
+        verification_uri = public_url("/device/verify")
         verification_uri_complete = f"{verification_uri}?user_code={quote(user_code)}"
         body = {
             "device_code": device_code,
