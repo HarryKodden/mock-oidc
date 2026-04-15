@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign-in successful - OIDC Provider</title>
+  <link rel="stylesheet" href="{{ base_path }}/static/styles.css">
+  <style>
+    .success-icon {
+      font-size: 64px;
+      text-align: center;
+      margin-bottom: 16px;
+      animation: pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+    @keyframes pop {
+      0%   { transform: scale(0); opacity: 0; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+    .user-badge {
+      background: #f6f8fa;
+      border: 1px solid #e1e4e8;
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin: 20px 0;
+      font-size: 14px;
+    }
+    .user-badge .label {
+      color: #888;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+    .user-badge .value {
+      color: #24292f;
+      font-weight: 600;
+      word-break: break-all;
+    }
+    .tag-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .tag {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border-radius: 20px;
+      padding: 3px 10px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .pin-box {
+      text-align: center;
+      margin: 24px 0 8px;
+    }
+    .pin-box .pin-label {
+      color: #666;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .pin-code {
+      display: inline-block;
+      font-size: 52px;
+      font-weight: 700;
+      letter-spacing: 0.25em;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      font-variant-numeric: tabular-nums;
+      animation: pop 0.5s 0.15s cubic-bezier(0.175, 0.885, 0.32, 1.275) both;
+    }
+    .pin-hint {
+      text-align: center;
+      color: #888;
+      font-size: 13px;
+      margin-top: 6px;
+    }
+    .close-hint {
+      text-align: center;
+      color: #aaa;
+      font-size: 12px;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="success-icon">🔐</div>
+    <h1>Sign-in successful</h1>
+    <p class="subtitle">Enter the verification code below in your terminal to complete sign-in.</p>
+
+    <div class="user-badge">
+      <div class="label">Signed in as</div>
+      <div class="value">{{ username }}</div>
+    </div>
+
+    {% if groups %}
+    <div class="user-badge">
+      <div class="label">Groups</div>
+      <div class="tag-list">
+        {% for g in groups %}
+        <span class="tag">{{ g }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="pin-box">
+      <div class="pin-label">Your verification code</div>
+      <div class="pin-code">{{ pin }}</div>
+    </div>
+    <p class="pin-hint">Type this code in your terminal when prompted.</p>
+
+    <p class="close-hint">You may close this window after entering the code.</p>
+  </div>
+</body>
+</html>

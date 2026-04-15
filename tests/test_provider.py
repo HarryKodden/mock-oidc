@@ -22,6 +22,7 @@ def running_server():
     provider.DEVICE_GRANTS.clear()
     provider.USER_CODE_INDEX.clear()
     provider.REFRESH_TOKENS.clear()
+    provider.PAM_SESSIONS.clear()
     provider.DEVICE_POLL_INTERVAL = 0  # skip slow_down between polls in tests
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), provider.OIDCHandler)
@@ -498,4 +499,108 @@ def test_public_url_mount_path_only_on_base_path():
     finally:
         provider.ISSUER = orig_issuer
         provider.BASE_PATH = orig_bp
+
+
+def test_pam_weblogin_flow(running_server):
+    """Full pam-weblogin phishing-resistant flow."""
+    base = running_server
+    bearer = provider.CLIENT_SECRET
+
+    # -----------------------------------------------------------------
+    # 1. Start a session
+    # -----------------------------------------------------------------
+    r = requests.post(
+        f"{base}/pam-weblogin/start",
+        headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"},
+        json={"user_id": "alice@example.com", "rhost": "10.0.0.1"},
+    )
+    assert r.status_code == 201
+    body = r.json()
+    session_id = body["session_id"]
+    challenge = body["challenge"]
+    assert session_id
+    assert "pam-weblogin/login/" in challenge
+    # PIN is the last space-separated token on the last line of the challenge
+    pin = challenge.strip().split()[-1]
+    assert len(pin) == 4 and pin.isdigit()
+
+    # -----------------------------------------------------------------
+    # 2. check-pin before browser login → FAIL (pending)
+    # -----------------------------------------------------------------
+    r = requests.post(
+        f"{base}/pam-weblogin/check-pin",
+        headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"},
+        json={"session_id": session_id, "pin": pin},
+    )
+    assert r.status_code == 200
+    assert r.json()["result"] == "FAIL"
+    assert r.json().get("reason") == "pending"
+
+    # -----------------------------------------------------------------
+    # 3. GET the browser login page
+    # -----------------------------------------------------------------
+    r = requests.get(f"{base}/pam-weblogin/login/{session_id}")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["Content-Type"]
+    assert "pam-weblogin" in r.text.lower() or "sign" in r.text.lower()
+
+    # -----------------------------------------------------------------
+    # 4. POST browser login (approve the session)
+    # -----------------------------------------------------------------
+    import json as _json
+    userinfo = _json.dumps({"sub": "alice@example.com", "email": "alice@example.com", "groups": ["staff"]})
+    r = requests.post(
+        f"{base}/pam-weblogin/login/{session_id}",
+        data={"userinfo": userinfo},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        allow_redirects=False,
+    )
+    assert r.status_code == 200
+    assert pin in r.text  # PIN shown on success page
+
+    # -----------------------------------------------------------------
+    # 5. check-pin with wrong PIN → FAIL
+    # -----------------------------------------------------------------
+    wrong_pin = "0000" if pin != "0000" else "1111"
+    r = requests.post(
+        f"{base}/pam-weblogin/check-pin",
+        headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"},
+        json={"session_id": session_id, "pin": wrong_pin},
+    )
+    assert r.status_code == 200
+    assert r.json()["result"] == "FAIL"
+
+    # -----------------------------------------------------------------
+    # 6. check-pin with correct PIN → SUCCESS
+    # -----------------------------------------------------------------
+    r = requests.post(
+        f"{base}/pam-weblogin/check-pin",
+        headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"},
+        json={"session_id": session_id, "pin": pin},
+    )
+    assert r.status_code == 200
+    resp = r.json()
+    assert resp["result"] == "SUCCESS"
+    assert resp["username"] == "alice@example.com"
+    assert "staff" in resp["groups"]
+
+    # -----------------------------------------------------------------
+    # 7. After SUCCESS the session is removed → 404
+    # -----------------------------------------------------------------
+    r = requests.post(
+        f"{base}/pam-weblogin/check-pin",
+        headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"},
+        json={"session_id": session_id, "pin": pin},
+    )
+    assert r.status_code == 404
+
+    # -----------------------------------------------------------------
+    # 8. No bearer token → 401
+    # -----------------------------------------------------------------
+    r = requests.post(
+        f"{base}/pam-weblogin/start",
+        headers={"Content-Type": "application/json"},
+        json={"user_id": "bob@example.com"},
+    )
+    assert r.status_code == 401
 

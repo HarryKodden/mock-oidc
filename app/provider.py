@@ -109,6 +109,10 @@ DEVICE_POLL_INTERVAL = int(os.getenv('DEVICE_POLL_INTERVAL', '5'))
 DEVICE_EXPIRES_SEC = int(os.getenv('DEVICE_EXPIRES_SEC', '600'))
 ACCESS_TOKEN_TTL_SEC = int(os.getenv('ACCESS_TOKEN_TTL_SEC', '3600'))
 REFRESH_TOKEN_TTL_SEC = int(os.getenv('REFRESH_TOKEN_TTL_SEC', str(7 * 24 * 3600)))
+# pam-weblogin: how long a session stays open waiting for browser login
+PAM_SESSION_EXPIRES_SEC = int(os.getenv('PAM_SESSION_EXPIRES_SEC', '120'))
+# pam-weblogin: Bearer token required on start/check-pin (defaults to CLIENT_SECRET)
+PAM_TOKEN = os.getenv('PAM_TOKEN', '')
 
 
 def _normalize_user_code(code: str) -> str:
@@ -222,6 +226,8 @@ DEVICE_GRANTS = {}
 USER_CODE_INDEX = {}
 # opaque refresh_token -> session (authorization_code / device_code / refresh rotation)
 REFRESH_TOKENS = {}
+# pam-weblogin sessions: session_id -> session record
+PAM_SESSIONS = {}
 
 
 def build_token_response(user_email, audience, user_roles, custom_claims, issue_refresh, client_ip_log):
@@ -412,6 +418,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_jwks()
         elif parsed_path.path == '/device/verify':
             self.handle_device_verify_get()
+        elif parsed_path.path.startswith('/pam-weblogin/login/'):
+            session_id = parsed_path.path[len('/pam-weblogin/login/'):]
+            self.handle_pam_weblogin_login_get(session_id)
         elif parsed_path.path.startswith('/test-token/'):
             # pass the full request path (including query string) so send_test_token
             # can parse query params correctly; translate path to routed form
@@ -452,6 +461,13 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_device_authorization()
         elif parsed_path.path == '/device/verify':
             self.handle_device_verify_post()
+        elif parsed_path.path == '/pam-weblogin/start':
+            self.send_pam_weblogin_start()
+        elif parsed_path.path == '/pam-weblogin/check-pin':
+            self.handle_pam_weblogin_check_pin()
+        elif parsed_path.path.startswith('/pam-weblogin/login/'):
+            session_id = parsed_path.path[len('/pam-weblogin/login/'):]
+            self.handle_pam_weblogin_login_post(session_id)
         else:
             logger.warning(f"404 Not Found: {parsed_path.path} from {client_ip}")
             self.send_response(404)
@@ -856,23 +872,24 @@ class OIDCHandler(BaseHTTPRequestHandler):
         grant['custom_claims'] = custom_claims
         del USER_CODE_INDEX[norm]
 
+        cookie_value = quote(json.dumps(custom_claims)) if custom_claims else quote(json.dumps({"sub": username, "email": username, "groups": roles}))
+        cookie_path = BASE_PATH or '/'
         try:
-            cookie_value = quote(json.dumps(custom_claims)) if custom_claims else quote(json.dumps({"sub": username, "email": username, "groups": roles}))
-            cookie_path = BASE_PATH or '/'
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.send_header('Set-Cookie', f"mock_oidc_userinfo={cookie_value}; Path={cookie_path}; HttpOnly; SameSite=Lax")
-            self.end_headers()
-            self.wfile.write(
-                b"<html><body><p>Device authorized. You may close this window.</p></body></html>"
-            )
+            template = TEMPLATES.get_template('device_success.html')
+            body = template.render(
+                base_path=BASE_PATH,
+                username=username,
+                groups=roles,
+            ).encode('utf-8')
         except Exception:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.end_headers()
-            self.wfile.write(
-                b"<html><body><p>Device authorized. You may close this window.</p></body></html>"
-            )
+            logger.exception("Failed to render device_success.html")
+            body = b"<html><body><p>Device authorized. You may close this window.</p></body></html>"
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Set-Cookie', f"mock_oidc_userinfo={cookie_value}; Path={cookie_path}; HttpOnly; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(body)
         logger.info(f"Device grant approved for user {username} from {client_ip}")
     
     def send_health(self):
@@ -1545,6 +1562,304 @@ class OIDCHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps(response).encode())
+
+    # ------------------------------------------------------------------ #
+    #  pam-weblogin endpoints                                             #
+    # ------------------------------------------------------------------ #
+
+    def _pam_bearer_ok(self) -> bool:
+        """Return True if the request carries a valid PAM Bearer token."""
+        auth = self.headers.get('Authorization', '')
+        if not auth.startswith('Bearer '):
+            return False
+        token = auth[len('Bearer '):]
+        expected = PAM_TOKEN if PAM_TOKEN else CLIENT_SECRET
+        return secrets.compare_digest(token, expected)
+
+    def send_pam_weblogin_start(self):
+        """POST /pam-weblogin/start — start a phishing-resistant PAM session."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
+        if not self._pam_bearer_ok():
+            self._send_json_error(401, {"error": "unauthorized", "error_description": "Bearer token required"})
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            body = json.loads(self.rfile.read(content_length).decode('utf-8')) if content_length else {}
+        except Exception:
+            self._send_json_error(400, {"error": "invalid_request", "error_description": "Invalid JSON body"})
+            return
+
+        user_id = body.get('user_id', '')
+        if not user_id:
+            self._send_json_error(400, {"error": "invalid_request", "error_description": "user_id required"})
+            return
+
+        rhost = body.get('rhost', '')
+        attribute = body.get('attribute', '')
+
+        # Generate a short alphanumeric session_id and a 4-digit numeric PIN
+        session_id = secrets.token_hex(6)  # 12-char hex
+        pin = ''.join(str(secrets.randbelow(10)) for _ in range(4))
+
+        expires = datetime.now(timezone.utc) + timedelta(seconds=PAM_SESSION_EXPIRES_SEC)
+        PAM_SESSIONS[session_id] = {
+            'user_id': user_id,
+            'rhost': rhost,
+            'attribute': attribute,
+            'pin': pin,
+            'expires': expires,
+            'status': 'pending',   # pending | approved | timeout
+            'username': None,
+            'groups': [],
+            'custom_claims': {},
+        }
+
+        login_url = public_url(f"/pam-weblogin/login/{session_id}")
+        challenge = (
+            f"Open the following URL to authenticate:\n"
+            f"  {login_url}\n"
+            f"After logging in, enter the verification code shown on screen.\n"
+            f"Your verification code: {pin}"
+        )
+
+        logger.info(f"PAM weblogin session {session_id} started for user_id={user_id!r} from {client_ip}")
+        self.send_response(201)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "session_id": session_id,
+            "challenge": challenge,
+            "cached": False,
+            "info": f"Session expires in {PAM_SESSION_EXPIRES_SEC}s",
+        }).encode())
+
+    def handle_pam_weblogin_login_get(self, session_id: str):
+        """GET /pam-weblogin/login/<session_id> — browser login page."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
+        session = PAM_SESSIONS.get(session_id)
+        if not session:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Session not found or expired.</body></html>")
+            return
+
+        if datetime.now(timezone.utc) > session['expires']:
+            session['status'] = 'timeout'
+            self.send_response(410)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>This session has expired.</body></html>")
+            return
+
+        if session['status'] == 'approved':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Already authenticated for this session.</body></html>")
+            return
+
+        saved_userinfo = None
+        cookie_header = self.headers.get('Cookie', '')
+        if cookie_header:
+            for part in cookie_header.split(';'):
+                kv = part.strip()
+                if kv.startswith('mock_oidc_userinfo='):
+                    try:
+                        cookie_val = unquote(kv.split('=', 1)[1])
+                        parsed = json.loads(cookie_val)
+                        if isinstance(parsed, dict):
+                            saved_userinfo = parsed
+                    except Exception:
+                        saved_userinfo = None
+                    break
+
+        if not saved_userinfo:
+            saved_userinfo = {
+                'sub': str(uuid.uuid4()),
+                'email': session['user_id'] if '@' in session.get('user_id', '') else f"{session['user_id']}@example.com",
+                'groups': ['developer'],
+            }
+
+        try:
+            template = TEMPLATES.get_template('pam_weblogin_login.html')
+            html = template.render(
+                base_path=BASE_PATH,
+                session_id=session_id,
+                user_id=session['user_id'],
+                saved_userinfo=saved_userinfo,
+            )
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(html.encode())
+        except Exception:
+            logger.exception("Failed to render pam_weblogin_login.html")
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Internal server error.</body></html>")
+
+    def handle_pam_weblogin_login_post(self, session_id: str):
+        """POST /pam-weblogin/login/<session_id> — approve session after browser auth."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
+        session = PAM_SESSIONS.get(session_id)
+        if not session:
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Session not found or expired.</body></html>")
+            return
+
+        if datetime.now(timezone.utc) > session['expires']:
+            session['status'] = 'timeout'
+            self.send_response(410)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>This session has expired.</body></html>")
+            return
+
+        if session['status'] == 'approved':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Already authenticated for this session.</body></html>")
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        post_params = parse_qs(post_data)
+
+        userinfo_text = post_params.get('userinfo', [''])[0]
+        username = ''
+        groups = []
+        custom_claims = {}
+
+        if userinfo_text:
+            try:
+                parsed = json.loads(userinfo_text)
+                if isinstance(parsed, dict):
+                    custom_claims = parsed.copy()
+                    username = parsed.get('email') or parsed.get('sub') or ''
+                    grps = parsed.get('groups') or parsed.get('roles')
+                    if isinstance(grps, list):
+                        groups = grps
+                    elif isinstance(grps, str):
+                        groups = [g.strip() for g in grps.split(',') if g.strip()]
+            except Exception as e:
+                logger.warning(f"PAM login: failed to parse userinfo JSON from {client_ip}: {e}")
+
+        if not username:
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body>Username / claims required.</body></html>")
+            return
+
+        session['status'] = 'approved'
+        session['username'] = username
+        session['groups'] = groups
+        session['custom_claims'] = custom_claims
+        logger.info(f"PAM weblogin session {session_id} approved for {username!r} from {client_ip}")
+
+        pin = session['pin']
+        cookie_value = quote(json.dumps(custom_claims) if custom_claims else json.dumps({"sub": username, "email": username, "groups": groups}))
+        cookie_path = BASE_PATH or '/'
+        try:
+            template = TEMPLATES.get_template('pam_weblogin_success.html')
+            body = template.render(
+                base_path=BASE_PATH,
+                username=username,
+                groups=groups,
+                pin=pin,
+            ).encode('utf-8')
+        except Exception:
+            logger.exception("Failed to render pam_weblogin_success.html")
+            body = (
+                f"<html><body><p>Authentication successful. Your verification code: <strong>{pin}</strong></p></body></html>"
+            ).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Set-Cookie', f"mock_oidc_userinfo={cookie_value}; Path={cookie_path}; HttpOnly; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_pam_weblogin_check_pin(self):
+        """POST /pam-weblogin/check-pin — poll for result (called by PAM module)."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
+        if not self._pam_bearer_ok():
+            self._send_json_error(401, {"error": "unauthorized", "error_description": "Bearer token required"})
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            body = json.loads(self.rfile.read(content_length).decode('utf-8')) if content_length else {}
+        except Exception:
+            self._send_json_error(400, {"error": "invalid_request", "error_description": "Invalid JSON body"})
+            return
+
+        session_id = body.get('session_id', '')
+        pin = str(body.get('pin', ''))
+
+        session = PAM_SESSIONS.get(session_id)
+        if not session:
+            self._send_json_error(404, {"error": "session_not_found"})
+            return
+
+        # Mark timeout if expired
+        if datetime.now(timezone.utc) > session['expires']:
+            session['status'] = 'timeout'
+
+        status = session['status']
+
+        if status == 'timeout':
+            logger.info(f"PAM check-pin for {session_id}: TIMEOUT")
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"result": "TIMEOUT"}).encode())
+            return
+
+        if status != 'approved':
+            # Still waiting for browser login
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"result": "FAIL", "reason": "pending"}).encode())
+            return
+
+        # Session approved — verify PIN
+        if not secrets.compare_digest(pin, session['pin']):
+            logger.warning(f"PAM check-pin for {session_id}: wrong PIN from {client_ip}")
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"result": "FAIL", "reason": "wrong_pin"}).encode())
+            return
+
+        # Success — clean up session
+        username = session['username']
+        groups = session['groups']
+        custom_claims = session.get('custom_claims', {})
+        PAM_SESSIONS.pop(session_id, None)
+        logger.info(f"PAM check-pin for {session_id}: SUCCESS user={username!r}")
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "result": "SUCCESS",
+            "username": username,
+            "groups": groups,
+            "claims": custom_claims,
+        }).encode())
+
 
 def cleanup_expired_tokens():
     """Clean up expired authorization codes and tokens"""

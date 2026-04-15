@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PAM weblogin - OIDC Provider</title>
+  <link rel="stylesheet" href="{{ base_path }}/static/styles.css">
+</head>
+<body>
+  <div class="login-container">
+    <h1>🔐 PAM weblogin</h1>
+    <p class="subtitle">Phishing-resistant sign-in — authenticate, then enter the verification code shown on this page in your terminal</p>
+
+    <form method="POST" action="{{ base_path }}/pam-weblogin/login/{{ session_id }}" id="pamForm">
+      <input type="hidden" id="userinfo" name="userinfo">
+
+      <div class="form-group">
+        <label>Claims</label>
+        <div id="claimsContainer"></div>
+        <div style="margin-top:8px">
+          <button type="button" id="addClaim">+ Add claim</button>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit">Sign in</button>
+      </div>
+    </form>
+
+    <div class="info-box">
+      <strong>Test Provider:</strong> Submitting this form approves the PAM session for <code>{{ user_id }}</code>.
+      After sign-in you will see a 4-digit verification code to enter in your terminal.
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      const form = document.getElementById('pamForm');
+      const container = document.getElementById('claimsContainer');
+      const hidden = document.getElementById('userinfo');
+      const addBtn = document.getElementById('addClaim');
+
+      let initial = null;
+      try {
+        initial = {{ saved_userinfo|tojson if saved_userinfo else 'null' }};
+      } catch (e) { initial = null; }
+      if (typeof initial === 'string' && initial) {
+        try { initial = JSON.parse(initial); } catch (e) { initial = null; }
+      }
+      if (!initial) {
+        try { initial = JSON.parse('{"sub":"user@example.com","email":"user@example.com","groups":["developer"]}'); } catch(e){ initial = {} }
+      }
+
+      function toDisplayValue(v) {
+        if (Array.isArray(v) || typeof v === 'object') return JSON.stringify(v);
+        return String(v);
+      }
+
+      function renderRows(obj){
+        container.innerHTML = '';
+        const keys = Object.keys(obj || {});
+        const ordered = [];
+        if (keys.includes('sub')) ordered.push('sub');
+        if (keys.includes('email')) ordered.push('email');
+        keys.forEach(function(k){ if (k !== 'sub' && k !== 'email') ordered.push(k); });
+        ordered.forEach(function(key){ addRow(key, toDisplayValue(obj[key])); });
+        validateAllKeys();
+      }
+
+      function addRow(key, value){
+        key = key || '';
+        value = value || '';
+        const row = document.createElement('div');
+        row.className = 'claim-row';
+        row.style.marginTop = '8px';
+        row.style.display = 'grid';
+        row.style.gridTemplateColumns = '140px 1fr 40px';
+        row.style.gridColumnGap = '8px';
+        row.style.alignItems = 'center';
+
+        const keyInput = document.createElement('input');
+        keyInput.type = 'text';
+        keyInput.placeholder = 'key';
+        keyInput.value = key;
+        keyInput.style.fontFamily = 'monospace';
+
+        const valInput = document.createElement('input');
+        valInput.type = 'text';
+        valInput.placeholder = 'value (or JSON)';
+        valInput.value = value;
+        valInput.style.fontFamily = 'monospace';
+
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.textContent = '✕';
+        del.title = 'Remove';
+        del.onclick = function(){ row.remove(); updateHidden(); validateAllKeys(); };
+
+        keyInput.addEventListener('input', function(){ updateHidden(); validateAllKeys(); });
+        valInput.addEventListener('input', function(){ updateHidden(); });
+
+        row.appendChild(keyInput);
+        row.appendChild(valInput);
+        row.appendChild(del);
+        container.appendChild(row);
+        updateHidden();
+      }
+
+      function validateAllKeys(){
+        const rows = container.querySelectorAll('.claim-row');
+        const seen = {};
+        rows.forEach(function(r){
+          const k = r.querySelectorAll('input')[0].value.trim();
+          if(k) seen[k] = (seen[k] || 0) + 1;
+        });
+        rows.forEach(function(r){
+          const ki = r.querySelectorAll('input')[0];
+          const k = ki.value.trim();
+          ki.style.borderColor = (k && seen[k] > 1) ? 'red' : '';
+        });
+      }
+
+      function updateHidden(){
+        const rows = container.querySelectorAll('.claim-row');
+        const obj = {};
+        rows.forEach(function(r){
+          const inputs = r.querySelectorAll('input');
+          const k = inputs[0].value.trim();
+          const v = inputs[1].value.trim();
+          if (!k) return;
+          try { obj[k] = JSON.parse(v); } catch(e){ obj[k] = v; }
+        });
+        hidden.value = JSON.stringify(obj);
+      }
+
+      addBtn.addEventListener('click', function(){ addRow('',''); });
+
+      form.addEventListener('submit', function(){ updateHidden(); });
+
+      renderRows(initial);
+    })();
+  </script>
+</body>
+</html>
