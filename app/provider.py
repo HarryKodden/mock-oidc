@@ -412,7 +412,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.handle_authorize()
         elif parsed_path.path == '/userinfo':
             self.send_userinfo()
-        elif parsed_path.path == '/jwks':
+        elif parsed_path.path == '/.well-known/jwks.json':
             self.send_jwks()
         elif parsed_path.path == '/device/verify':
             self.handle_device_verify_get()
@@ -996,7 +996,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "authorization_endpoint": public_url("/authorize"),
             "token_endpoint": public_url("/token"),
             "userinfo_endpoint": public_url("/userinfo"),
-            "jwks_uri": public_url("/jwks"),
+            "jwks_uri": public_url("/.well-known/jwks.json"),
             "device_authorization_endpoint": public_url("/device"),
             "response_types_supported": ["code", "token", "id_token"],
             "grant_types_supported": [
@@ -1611,7 +1611,7 @@ def main():
     logger.info(f"Discovery: {ISSUER}/.well-known/openid-configuration")
     logger.info(f"Token: {ISSUER}/token")
     logger.info(f"UserInfo: {ISSUER}/userinfo")
-    logger.info(f"JWKS: {ISSUER}/jwks")
+    logger.info(f"JWKS: {ISSUER}/.well-known/jwks.json")
     logger.info(f"Introspection: {ISSUER}/introspect")
     logger.info(f"Device authorization: {ISSUER}/device")
     logger.info(f"Device verify (browser): {ISSUER}/device/verify")
