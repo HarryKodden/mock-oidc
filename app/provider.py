@@ -199,11 +199,7 @@ def _load_rsa_key_and_jwks():
         "n": _int_to_base64url(numbers.n),
         "e": _int_to_base64url(numbers.e),
     }
-    if cert_pem:
-        # x5c: array of base64-encoded DER certs (use first cert from PEM)
-        cert_obj = x509.load_pem_x509_certificate(cert_pem)
-        der = cert_obj.public_bytes(serialization.Encoding.DER)
-        jwk["x5c"] = [base64.b64encode(der).decode()]
+    # x5c intentionally omitted — bare RSA key fields only (kty, kid, use, alg, n, e)
 
     private_key_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,

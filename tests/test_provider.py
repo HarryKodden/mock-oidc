@@ -76,7 +76,7 @@ def test_discovery_and_jwks(running_server):
     assert doc.get('introspection_endpoint') == f"{provider.ISSUER}/introspect"
     assert 'refresh_token' in doc.get('grant_types_supported', [])
 
-    # JWKS: RS256 key with x5c (client expects RS256/x5c)
+    # JWKS: RS256 bare key (kty, kid, alg, n, e — no x5c)
     r = requests.get(f"{base}/.well-known/jwks.json")
     assert r.status_code == 200
     jwks = r.json()
@@ -87,8 +87,7 @@ def test_discovery_and_jwks(running_server):
     assert key.get('kty') == 'RSA'
     assert key.get('alg') == 'RS256'
     assert 'n' in key and 'e' in key
-    assert 'x5c' in key
-    assert len(key['x5c']) >= 1
+    assert 'x5c' not in key
 
 
 def test_pkce_authorization_code_s256(running_server):
