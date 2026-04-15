@@ -77,7 +77,7 @@ def test_discovery_and_jwks(running_server):
     assert 'refresh_token' in doc.get('grant_types_supported', [])
 
     # JWKS: RS256 key with x5c (client expects RS256/x5c)
-    r = requests.get(f"{base}/jwks")
+    r = requests.get(f"{base}/.well-known/jwks.json")
     assert r.status_code == 200
     jwks = r.json()
     keys = jwks.get('keys', [])
