@@ -17,6 +17,15 @@
     .device-pre { background: #f6f8fa; padding: 12px; border-radius: 8px; font-size: 11px; overflow-x: auto; text-align: left; max-height: 220px; margin-top: 12px; display: none; }
     .device-pre.show { display: block; }
     .device-links { margin-top: 10px; font-size: 13px; }
+    .pam-box { margin-top: 24px; text-align: left; border-top: 1px solid #e1e4e8; padding-top: 20px; }
+    .pam-box h2 { font-size: 15px; color: #333; margin-bottom: 10px; }
+    .pam-box button { width: auto; display: inline-block; padding: 10px 18px; font-size: 14px; margin-right: 8px; margin-bottom: 8px; }
+    .pam-pre { background: #f6f8fa; padding: 12px; border-radius: 8px; font-size: 11px; overflow-x: auto; text-align: left; max-height: 280px; margin-top: 12px; display: none; }
+    .pam-pre.show { display: block; }
+    .pin-display { font-size: 40px; font-weight: 700; letter-spacing: 0.2em; text-align: center; margin: 10px 0;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; display: none; }
+    .pam-link { margin-top: 8px; font-size: 13px; display: none; }
   </style>
 </head>
 <body>
@@ -35,8 +44,8 @@
         <code>redirect_uri={{ callback_uri }}</code>
       </li>
       <li>
-        <a href="{{ base_path }}/jwks">JWKS</a>
-        <code>GET /jwks</code>
+        <a href="{{ base_path }}/.well-known/jwks.json">JWKS</a>
+        <code>GET /.well-known/jwks.json</code>
       </li>
       <li>
         <a href="{{ base_path }}/health">Health (JSON)</a>
@@ -55,6 +64,15 @@
       <button type="button" id="stopPoll" disabled>Stop polling</button>
       <div class="device-links" id="deviceLinks" style="display:none;"></div>
       <pre class="device-pre" id="devicePre"></pre>
+    </div>
+
+    <div class="pam-box">
+      <h2>PAM weblogin flow</h2>
+      <p style="font-size: 12px; color: #666;">Starts a phishing-resistant pam-weblogin session. Open the link in a new tab, sign in, then enter the shown PIN to complete authentication.</p>
+      <button type="button" id="startPam">Start PAM session</button>
+      <div class="pin-display" id="pamPin"></div>
+      <div class="pam-link" id="pamLink"></div>
+      <pre class="pam-pre" id="pamPre"></pre>
     </div>
 
     <div class="info-box">
@@ -133,6 +151,46 @@
       btnStop.onclick = function() {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         btnStop.disabled = true;
+      };
+
+      // ---- PAM weblogin ----
+      const pamPre = document.getElementById('pamPre');
+      const pamPin = document.getElementById('pamPin');
+      const pamLink = document.getElementById('pamLink');
+
+      function pamShow(obj) {
+        pamPre.classList.add('show');
+        pamPre.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+      }
+
+      document.getElementById('startPam').onclick = async function() {
+        pamPin.style.display = 'none';
+        pamLink.style.display = 'none';
+        pamPre.classList.remove('show');
+
+        const r = await fetch(base + '/pam-weblogin/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + clientSecret },
+          body: JSON.stringify({ user_id: 'demo@example.com', rhost: 'browser' })
+        });
+        const j = await r.json();
+        if (!r.ok) { pamShow(j); return; }
+
+        // Extract PIN from the last word of the challenge
+        const pin = (j.challenge || '').trim().split(/\s+/).pop();
+        // Extract login URL (second line of challenge)
+        const loginUrl = (j.challenge || '').split('\n').map(function(l){ return l.trim(); }).find(function(l){ return l.startsWith('http'); }) || '';
+
+        pamShow(j);
+        if (pin && /^\d{4}$/.test(pin)) {
+          pamPin.textContent = pin;
+          pamPin.style.display = 'block';
+        }
+        if (loginUrl) {
+          pamLink.style.display = 'block';
+          pamLink.innerHTML = '<a href="' + loginUrl + '" target="_blank" rel="noopener">Open login page ↗</a>' +
+            ' &mdash; sign in, then enter the code above in your terminal.';
+        }
       };
     })();
   </script>
