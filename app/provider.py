@@ -18,6 +18,8 @@ import secrets
 import logging
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import urllib.request
+import urllib.error
 from urllib.parse import urlparse, parse_qs, quote, unquote, urlencode
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -113,6 +115,9 @@ REFRESH_TOKEN_TTL_SEC = int(os.getenv('REFRESH_TOKEN_TTL_SEC', str(7 * 24 * 3600
 PAM_SESSION_EXPIRES_SEC = int(os.getenv('PAM_SESSION_EXPIRES_SEC', '120'))
 # pam-weblogin: Bearer token required on start/check-pin (defaults to CLIENT_SECRET)
 PAM_TOKEN = os.getenv('PAM_TOKEN', '')
+# pam-weblogin: upstream proxy — when set, start/check-pin are forwarded 1:1 to upstream
+PAM_UPSTREAM_URL = os.getenv('PAM_UPSTREAM_URL', '').rstrip('/')
+PAM_UPSTREAM_TOKEN = os.getenv('PAM_UPSTREAM_TOKEN', '')
 
 
 def _normalize_user_code(code: str) -> str:
@@ -1576,6 +1581,36 @@ class OIDCHandler(BaseHTTPRequestHandler):
         expected = PAM_TOKEN if PAM_TOKEN else CLIENT_SECRET
         return secrets.compare_digest(token, expected)
 
+    def _proxy_pam_request(self, path: str, body_bytes: bytes, content_type: str):
+        """Forward a PAM request to the upstream server.
+
+        Returns (status_code: int, body: bytes, content_type: str).
+        The caller is responsible for sending those values back to the client.
+        """
+        url = PAM_UPSTREAM_URL + path
+        req = urllib.request.Request(
+            url,
+            data=body_bytes,
+            method='POST',
+            headers={
+                'Authorization': f'Bearer {PAM_UPSTREAM_TOKEN}',
+                'Content-Type': content_type or 'application/json',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_body = resp.read()
+                resp_ct = resp.getheader('Content-Type', 'application/json')
+                return resp.status, resp_body, resp_ct
+        except urllib.error.HTTPError as exc:
+            resp_body = exc.read()
+            resp_ct = exc.headers.get('Content-Type', 'application/json')
+            return exc.code, resp_body, resp_ct
+        except Exception as exc:
+            logger.error(f"PAM proxy error forwarding to {url}: {exc}")
+            err = json.dumps({"error": "upstream_error", "error_description": str(exc)}).encode()
+            return 502, err, 'application/json'
+
     def send_pam_weblogin_start(self):
         """POST /pam-weblogin/start — start a phishing-resistant PAM session."""
         client_ip = self.client_address[0] if self.client_address else 'unknown'
@@ -1585,8 +1620,22 @@ class OIDCHandler(BaseHTTPRequestHandler):
             return
 
         content_length = int(self.headers.get('Content-Length', 0))
+        raw_body = self.rfile.read(content_length) if content_length else b''
+
+        # Proxy mode: forward request verbatim to upstream with upstream bearer token
+        if PAM_UPSTREAM_URL:
+            ct = self.headers.get('Content-Type', 'application/json')
+            status, resp_body, resp_ct = self._proxy_pam_request('/pam-weblogin/start', raw_body, ct)
+            logger.info(f"PAM proxy start → upstream status={status} from {client_ip}")
+            self.send_response(status)
+            self.send_header('Content-Type', resp_ct)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(resp_body)
+            return
+
         try:
-            body = json.loads(self.rfile.read(content_length).decode('utf-8')) if content_length else {}
+            body = json.loads(raw_body.decode('utf-8')) if raw_body else {}
         except Exception:
             self._send_json_error(400, {"error": "invalid_request", "error_description": "Invalid JSON body"})
             return
@@ -1799,8 +1848,21 @@ class OIDCHandler(BaseHTTPRequestHandler):
             return
 
         content_length = int(self.headers.get('Content-Length', 0))
+        raw_body = self.rfile.read(content_length) if content_length else b''
+
+        # Proxy mode: forward request verbatim to upstream with upstream bearer token
+        if PAM_UPSTREAM_URL:
+            ct = self.headers.get('Content-Type', 'application/json')
+            status, resp_body, resp_ct = self._proxy_pam_request('/pam-weblogin/check-pin', raw_body, ct)
+            logger.info(f"PAM proxy check-pin → upstream status={status} from {client_ip}")
+            self.send_response(status)
+            self.send_header('Content-Type', resp_ct)
+            self.end_headers()
+            self.wfile.write(resp_body)
+            return
+
         try:
-            body = json.loads(self.rfile.read(content_length).decode('utf-8')) if content_length else {}
+            body = json.loads(raw_body.decode('utf-8')) if raw_body else {}
         except Exception:
             self._send_json_error(400, {"error": "invalid_request", "error_description": "Invalid JSON body"})
             return
