@@ -26,6 +26,14 @@
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; display: none; }
     .pam-link { margin-top: 8px; font-size: 13px; display: none; }
+    .qr-img { display: none; text-align: center; margin: 14px 0 6px; }
+    .qr-img img { max-width: 180px; border: 3px solid #667eea; border-radius: 8px; }
+    .pin-entry { display: none; margin-top: 12px; }
+    .pin-entry label { font-size: 13px; color: #555; display: block; margin-bottom: 6px; }
+    .pin-entry input { font-size: 24px; letter-spacing: 0.3em; width: 120px; text-align: center; padding: 8px 10px; border: 2px solid #667eea; border-radius: 8px; outline: none; }
+    .pin-entry input:focus { border-color: #764ba2; }
+    .pin-entry button { padding: 10px 18px; font-size: 14px; margin-left: 10px; }
+    #pamVerifyResult { margin-left: 8px; font-size: 13px; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -71,7 +79,14 @@
       <p style="font-size: 12px; color: #666;">Starts a phishing-resistant pam-weblogin session. Open the link in a new tab, sign in, then enter the shown PIN to complete authentication.</p>
       <button type="button" id="startPam">Start PAM session</button>
       <div class="pin-display" id="pamPin"></div>
+      <div class="qr-img" id="pamQr"><img id="pamQrImg" src="" alt="QR code"></div>
       <div class="pam-link" id="pamLink"></div>
+      <div class="pin-entry" id="pamPinEntry">
+        <label>Enter the verification code shown in the browser window:</label>
+        <input type="text" id="pamPinInput" maxlength="8" placeholder="0000" autocomplete="one-time-code">
+        <button type="button" id="pamVerify">Verify</button>
+        <span id="pamVerifyResult"></span>
+      </div>
       <pre class="pam-pre" id="pamPre"></pre>
     </div>
 
@@ -157,6 +172,12 @@
       const pamPre = document.getElementById('pamPre');
       const pamPin = document.getElementById('pamPin');
       const pamLink = document.getElementById('pamLink');
+      const pamQr = document.getElementById('pamQr');
+      const pamQrImg = document.getElementById('pamQrImg');
+      const pamPinEntry = document.getElementById('pamPinEntry');
+      const pamVerifyResult = document.getElementById('pamVerifyResult');
+
+      let pamSessionId = null;
 
       function pamShow(obj) {
         pamPre.classList.add('show');
@@ -166,7 +187,12 @@
       document.getElementById('startPam').onclick = async function() {
         pamPin.style.display = 'none';
         pamLink.style.display = 'none';
+        pamQr.style.display = 'none';
+        pamPinEntry.style.display = 'none';
+        pamVerifyResult.textContent = '';
+        pamVerifyResult.style.color = '';
         pamPre.classList.remove('show');
+        pamSessionId = null;
 
         const r = await fetch(base + '/pam-weblogin/start', {
           method: 'POST',
@@ -176,22 +202,78 @@
         const j = await r.json();
         if (!r.ok) { pamShow(j); return; }
 
-        // Extract PIN from the last word of the challenge
-        const pin = (j.challenge || '').trim().split(/\s+/).pop();
-        // Extract login URL (second line of challenge)
-        const loginUrl = (j.challenge || '').split('\n').map(function(l){ return l.trim(); }).find(function(l){ return l.startsWith('http'); }) || '';
-
+        pamSessionId = j.session_id || null;
         pamShow(j);
-        if (pin && /^\d{4}$/.test(pin)) {
-          pamPin.textContent = pin;
-          pamPin.style.display = 'block';
-        }
-        if (loginUrl) {
+
+        if (j.url) {
+          // Upstream / proxy mode: response has a direct login URL and optional QR code PNG.
+          // Open the URL in a new window immediately; also show QR + PIN input here.
+          if (j.qr_code_png) {
+            pamQrImg.src = 'data:image/png;base64,' + j.qr_code_png;
+            pamQr.style.display = 'block';
+          }
           pamLink.style.display = 'block';
-          pamLink.innerHTML = '<a href="' + loginUrl + '" target="_blank" rel="noopener">Open login page ↗</a>' +
-            ' &mdash; sign in, then enter the code above in your terminal.';
+          pamLink.innerHTML = '<a href="' + j.url + '" target="_blank" rel="noopener noreferrer">Open login page ↗</a>' +
+            ' &mdash; sign in, then enter the verification code shown there below.';
+          window.open(j.url, '_blank', 'noopener,noreferrer');
+          pamPinEntry.style.display = 'block';
+        } else {
+          // Local mode: PIN is the last word of the challenge text, login URL is any http line.
+          const pin = (j.challenge || '').trim().split(/\s+/).pop();
+          const loginUrl = (j.challenge || '').split('\n')
+            .map(function(l){ return l.trim(); })
+            .find(function(l){ return l.startsWith('http'); }) || '';
+
+          if (pin && /^\d{4}$/.test(pin)) {
+            pamPin.textContent = pin;
+            pamPin.style.display = 'block';
+          }
+          if (loginUrl) {
+            pamLink.style.display = 'block';
+            pamLink.innerHTML = '<a href="' + loginUrl + '" target="_blank" rel="noopener">Open login page ↗</a>' +
+              ' &mdash; sign in, then enter the code above in your terminal.';
+          }
         }
       };
+
+      document.getElementById('pamVerify').onclick = async function() {
+        if (!pamSessionId) { pamVerifyResult.textContent = 'No active session.'; return; }
+        const pin = document.getElementById('pamPinInput').value.trim();
+        if (!pin) { pamVerifyResult.textContent = 'Enter a PIN first.'; return; }
+
+        pamVerifyResult.style.color = '#666';
+        pamVerifyResult.textContent = 'Checking…';
+        const r = await fetch(base + '/pam-weblogin/check-pin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + clientSecret },
+          body: JSON.stringify({ session_id: pamSessionId, pin: pin })
+        });
+        const j = await r.json();
+        pamShow(j);
+        if (j.result === 'SUCCESS') {
+          pamVerifyResult.style.color = '#22863a';
+          pamVerifyResult.textContent = '\u2713 Authenticated as ' + (j.username || 'unknown');
+          pamPinEntry.style.display = 'none';
+        } else if (j.result === 'FAIL' && j.reason === 'pending') {
+          pamVerifyResult.style.color = '#e36209';
+          pamVerifyResult.textContent = 'Still waiting for browser login…';
+        } else if (j.result === 'FAIL') {
+          pamVerifyResult.style.color = '#cb2431';
+          pamVerifyResult.textContent = 'Wrong PIN — try again.';
+        } else if (j.result === 'TIMEOUT') {
+          pamVerifyResult.style.color = '#cb2431';
+          pamVerifyResult.textContent = 'Session expired.';
+          pamPinEntry.style.display = 'none';
+        } else {
+          pamVerifyResult.style.color = '#cb2431';
+          pamVerifyResult.textContent = JSON.stringify(j);
+        }
+      };
+
+      // Allow pressing Enter in the PIN input to trigger verify
+      document.getElementById('pamPinInput').addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') document.getElementById('pamVerify').click();
+      });
     })();
   </script>
 </body>
