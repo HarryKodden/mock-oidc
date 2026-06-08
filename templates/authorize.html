@@ -64,7 +64,7 @@
         }
       }
       if (!initial) {
-        try { initial = JSON.parse('{"sub":"user@example.com","email":"user@example.com","groups":["developer"]}'); } catch(e){ initial = {} }
+        initial = {{ default_claims | tojson }};
       }
 
       function toDisplayValue(v) {

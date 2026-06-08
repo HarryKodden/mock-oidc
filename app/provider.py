@@ -45,6 +45,14 @@ CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
 ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups')
 STRICT_CLIENT_AUTH = os.getenv('STRICT_CLIENT_AUTH', 'true').lower() in ('1','true','yes')
+# Per-scope default claims for login forms: DEFAULT_CLAIMS_<SCOPE> env vars (JSON).
+# Use "$uuid" as a string value to generate a fresh UUID on each form load.
+_BUILTIN_SCOPE_DEFAULT_CLAIMS = {
+    'openid': {'sub': '$uuid'},
+    'profile': {'name': 'Example User', 'preferred_username': 'user'},
+    'email': {'email': 'user@example.com', 'email_verified': True},
+}
+_BUILTIN_SCOPE_DEFAULT_CLAIMS[ROLES_CLAIM.lower()] = {ROLES_CLAIM: ['developer']}
 # Optional base path (when the app is mounted at a subpath behind a reverse proxy)
 BASE_PATH = os.getenv('BASE_PATH', '')
 if BASE_PATH:
@@ -148,6 +156,110 @@ def _verify_pkce(stored_challenge: str, stored_method: str, code_verifier: str) 
     return False
 
 
+def _parse_scopes(scope: str) -> list[str]:
+    """Split an OAuth scope string into individual scope names."""
+    return [s for s in (scope or '').split() if s]
+
+
+def _scope_env_var(scope: str) -> str:
+    """Map a scope name to its DEFAULT_CLAIMS_<SCOPE> environment variable."""
+    suffix = re.sub(r'[^A-Z0-9]', '_', scope.upper())
+    return f'DEFAULT_CLAIMS_{suffix}'
+
+
+def _claims_for_scope(scope: str) -> dict:
+    """Return default claims template for one scope (without $uuid expansion)."""
+    scope_key = scope.strip().lower()
+    if not scope_key:
+        return {}
+    env_key = _scope_env_var(scope_key)
+    raw = os.getenv(env_key, '').strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning("%s must be a JSON object; using built-in for scope %r", env_key, scope_key)
+        except json.JSONDecodeError as exc:
+            logger.warning("Invalid %s JSON (%s); using built-in for scope %r", env_key, exc, scope_key)
+    return dict(_BUILTIN_SCOPE_DEFAULT_CLAIMS.get(scope_key, {}))
+
+
+def _configured_default_claims(scopes: str | list[str] | None = None) -> dict:
+    """Merge default claim templates for the requested scope(s)."""
+    if scopes is None:
+        scope_list = ['openid']
+    elif isinstance(scopes, str):
+        scope_list = _parse_scopes(scopes)
+    else:
+        scope_list = [s for s in scopes if s]
+    if not scope_list:
+        scope_list = ['openid']
+    merged = {}
+    for scope in scope_list:
+        merged.update(_claims_for_scope(scope))
+    return merged
+
+
+def _expand_claim_placeholders(claims: dict) -> dict:
+    """Return a copy of claims with '$uuid' string values replaced by fresh UUIDs."""
+    out = {}
+    for key, value in claims.items():
+        if value == '$uuid':
+            out[key] = str(uuid.uuid4())
+        elif isinstance(value, dict):
+            out[key] = _expand_claim_placeholders(value)
+        elif isinstance(value, list):
+            out[key] = [
+                str(uuid.uuid4()) if item == '$uuid' else item
+                for item in value
+            ]
+        else:
+            out[key] = value
+    if 'sub' not in out or not out.get('sub'):
+        out['sub'] = str(uuid.uuid4())
+    return out
+
+
+def default_userinfo(scopes: str | list[str] | None = None, overrides: dict | None = None) -> dict:
+    """Default claims for login forms; cookie values take precedence when present."""
+    info = _expand_claim_placeholders(_configured_default_claims(scopes))
+    if overrides:
+        info.update(overrides)
+    return info
+
+
+def _userinfo_from_cookie(cookie_header: str):
+    """Parse mock_oidc_userinfo cookie into a claims dict, or None."""
+    if not cookie_header:
+        return None
+    for part in cookie_header.split(';'):
+        kv = part.strip()
+        if not kv.startswith('mock_oidc_userinfo='):
+            continue
+        try:
+            cookie_val = unquote(kv.split('=', 1)[1])
+            parsed = json.loads(cookie_val)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        break
+    return None
+
+
+def resolve_form_userinfo(
+    cookie_header: str,
+    scopes: str | list[str] | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Cookie-backed userinfo for forms, otherwise scope-based configured defaults."""
+    saved = _userinfo_from_cookie(cookie_header)
+    if saved:
+        return saved
+    return default_userinfo(scopes, overrides)
+
+
 def _int_to_base64url(i: int) -> str:
     """Encode a positive integer as base64url (JWK n/e)."""
     byt = i.to_bytes((i.bit_length() + 7) // 8 or 1, 'big')
@@ -233,6 +345,15 @@ USER_CODE_INDEX = {}
 REFRESH_TOKENS = {}
 # pam-weblogin sessions: session_id -> session record
 PAM_SESSIONS = {}
+
+
+def _scope_from_device_user_code(user_code: str) -> str:
+    """Return the scope from a pending device grant, if the user code is known."""
+    norm = _normalize_user_code(user_code)
+    device_code = USER_CODE_INDEX.get(norm)
+    if device_code and device_code in DEVICE_GRANTS:
+        return DEVICE_GRANTS[device_code].get('scope', '') or ''
+    return ''
 
 
 def build_token_response(user_email, audience, user_roles, custom_claims, issue_refresh, client_ip_log):
@@ -492,10 +613,14 @@ class OIDCHandler(BaseHTTPRequestHandler):
         response_type = params.get('response_type', [''])[0]
         code_challenge = params.get('code_challenge', [''])[0]
         code_challenge_method = params.get('code_challenge_method', [''])[0]
+        scope = params.get('scope', [''])[0]
         if code_challenge and not code_challenge_method:
             code_challenge_method = "S256"
 
-        logger.info(f"Authorization request from {client_ip} - client_id: {client_id}, response_type: {response_type}")
+        logger.info(
+            f"Authorization request from {client_ip} - client_id: {client_id}, "
+            f"response_type: {response_type}, scope: {scope or 'openid'}"
+        )
 
         if not redirect_uri:
             logger.error(f"Missing redirect_uri in authorization request from {client_ip}")
@@ -505,36 +630,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid_request"}).encode())
             return
         
-        # Try to prefill userinfo from cookie if present; otherwise generate defaults
-        saved_userinfo = None
-        cookie_header = self.headers.get('Cookie', '')
-        if cookie_header:
-            # simple cookie parse
-            for part in cookie_header.split(';'):
-                kv = part.strip()
-                if kv.startswith('mock_oidc_userinfo='):
-                    try:
-                        cookie_val = unquote(kv.split('=', 1)[1])
-                        # try to parse JSON cookie into an object
-                        try:
-                            parsed = json.loads(cookie_val)
-                            if isinstance(parsed, dict):
-                                saved_userinfo = parsed
-                            else:
-                                saved_userinfo = None
-                        except Exception:
-                            saved_userinfo = None
-                    except Exception:
-                        saved_userinfo = None
-                    break
-
-        # If no saved userinfo, create sensible defaults with a generated sub UUID
-        if not saved_userinfo:
-            saved_userinfo = {
-                'sub': str(uuid.uuid4()),
-                'email': 'user@example.com',
-                'groups': ['developer']
-            }
+        saved_userinfo = resolve_form_userinfo(self.headers.get('Cookie', ''), scopes=scope)
 
         # Render authorize template
         try:
@@ -545,8 +641,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 state=state,
                 response_type=response_type,
                 code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                scope=scope,
                 base_path=BASE_PATH,
                 saved_userinfo=saved_userinfo,
+                default_claims=_configured_default_claims(scope),
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
@@ -759,31 +858,12 @@ class OIDCHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else 'unknown'
         params = parse_qs(parsed_path.query)
         user_code_prefill = params.get('user_code', [''])[0]
+        device_scope = _scope_from_device_user_code(user_code_prefill)
 
-        saved_userinfo = None
-        cookie_header = self.headers.get('Cookie', '')
-        if cookie_header:
-            for part in cookie_header.split(';'):
-                kv = part.strip()
-                if kv.startswith('mock_oidc_userinfo='):
-                    try:
-                        cookie_val = unquote(kv.split('=', 1)[1])
-                        try:
-                            parsed = json.loads(cookie_val)
-                            if isinstance(parsed, dict):
-                                saved_userinfo = parsed
-                        except Exception:
-                            saved_userinfo = None
-                    except Exception:
-                        saved_userinfo = None
-                    break
-
-        if not saved_userinfo:
-            saved_userinfo = {
-                'sub': str(uuid.uuid4()),
-                'email': 'user@example.com',
-                'groups': ['developer']
-            }
+        saved_userinfo = resolve_form_userinfo(
+            self.headers.get('Cookie', ''),
+            scopes=device_scope,
+        )
 
         try:
             template = TEMPLATES.get_template('device.html')
@@ -791,6 +871,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 base_path=BASE_PATH,
                 user_code_prefill=user_code_prefill,
                 saved_userinfo=saved_userinfo,
+                default_claims=_configured_default_claims(device_scope),
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
@@ -1712,27 +1793,16 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"<html><body>Already authenticated for this session.</body></html>")
             return
 
-        saved_userinfo = None
-        cookie_header = self.headers.get('Cookie', '')
-        if cookie_header:
-            for part in cookie_header.split(';'):
-                kv = part.strip()
-                if kv.startswith('mock_oidc_userinfo='):
-                    try:
-                        cookie_val = unquote(kv.split('=', 1)[1])
-                        parsed = json.loads(cookie_val)
-                        if isinstance(parsed, dict):
-                            saved_userinfo = parsed
-                    except Exception:
-                        saved_userinfo = None
-                    break
-
-        if not saved_userinfo:
-            saved_userinfo = {
-                'sub': str(uuid.uuid4()),
-                'email': session['user_id'] if '@' in session.get('user_id', '') else f"{session['user_id']}@example.com",
-                'groups': ['developer'],
-            }
+        pam_overrides = {}
+        user_id = session.get('user_id', '')
+        if user_id:
+            pam_email = user_id if '@' in user_id else f"{user_id}@example.com"
+            pam_overrides = {'sub': pam_email, 'email': pam_email}
+        saved_userinfo = resolve_form_userinfo(
+            self.headers.get('Cookie', ''),
+            scopes='openid',
+            overrides=pam_overrides or None,
+        )
 
         try:
             template = TEMPLATES.get_template('pam_weblogin_login.html')
@@ -1741,6 +1811,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 session_id=session_id,
                 user_id=session['user_id'],
                 saved_userinfo=saved_userinfo,
+                default_claims=_configured_default_claims('openid'),
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
@@ -1976,6 +2047,12 @@ def main():
     logger.info(f"Client ID: {CLIENT_ID}")
     logger.info(f"Client Secret: {CLIENT_SECRET}")
     logger.info(f"Roles Claim: {ROLES_CLAIM}")
+    logger.info("Default claims per scope (built-in when env unset):")
+    for scope_name in sorted(_BUILTIN_SCOPE_DEFAULT_CLAIMS):
+        env_key = _scope_env_var(scope_name)
+        configured = os.getenv(env_key, '').strip()
+        source = env_key if configured else 'built-in'
+        logger.info(f"  {scope_name}: {json.dumps(_claims_for_scope(scope_name))} ({source})")
     logger.info(f"Strict client auth: {STRICT_CLIENT_AUTH}")
     logger.info("=" * 50)
     logger.info(f"Root: {ISSUER}/")

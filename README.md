@@ -188,6 +188,7 @@ Defaults apply when a variable is unset.
 | `CLIENT_ID` | `test-client` | OAuth client id; must match the client when `STRICT_CLIENT_AUTH` is enabled. |
 | `CLIENT_SECRET` | `test-secret` | Client secret for strict auth and confidential flows. |
 | `ROLES_CLAIM` | `groups` | Claim name used for roles/groups in tokens and `/userinfo`. |
+| `DEFAULT_CLAIMS_<SCOPE>` | *(per-scope built-in)* | JSON object of default/example claims for that OAuth scope on `/authorize` and `/device/verify` when no `mock_oidc_userinfo` cookie is set. Claims from multiple requested scopes are merged (e.g. `scope=openid email` uses `DEFAULT_CLAIMS_OPENID` + `DEFAULT_CLAIMS_EMAIL`). If `scope` is omitted, only `openid` defaults apply. Use `"$uuid"` as a string value to generate a fresh UUID on each form load. Built-in defaults: `DEFAULT_CLAIMS_OPENID` → `{"sub":"$uuid"}`, `DEFAULT_CLAIMS_PROFILE` → `{"name":"Example User","preferred_username":"user"}`, `DEFAULT_CLAIMS_EMAIL` → `{"email":"user@example.com","email_verified":true}`, `DEFAULT_CLAIMS_GROUPS` → `{"groups":["developer"]}` (uses `ROLES_CLAIM` name). Custom scopes map to env names by uppercasing (e.g. scope `roles:admin` → `DEFAULT_CLAIMS_ROLES_ADMIN`). |
 | `STRICT_CLIENT_AUTH` | `true` | If true, `client_id` / `client_secret` must match `CLIENT_ID` / `CLIENT_SECRET` where applicable. Use `false` for permissive local testing. |
 | `BASE_PATH` | *(empty)* | **Path** prefix when the app is mounted under a URL path (e.g. `/oidc`), not the hostname. Must not duplicate a path already included in **`ISSUER`**. If you mistakenly set this to your host name (e.g. `oidc.apps.fried-air.com`), it is ignored for generated URLs and a warning is logged. |
 | `OIDC_RSA_PRIVATE_KEY` | *(generate)* | Path to PEM file or PEM string of the RSA **private** key used to sign JWTs. If unset, a key is generated at startup (not stable across restarts). |
@@ -202,6 +203,13 @@ Defaults apply when a variable is unset.
 
 - `SECRET` is reserved in code but **JWTs are not signed with it**; signing uses the RSA key above.
 - Completing `/authorize` sets a cookie `mock_oidc_userinfo` to prefill the next authorize or device verification page.
+- Example custom default claims per scope:
+  ```bash
+  DEFAULT_CLAIMS_OPENID='{"sub":"$uuid"}' \
+  DEFAULT_CLAIMS_EMAIL='{"email":"alice@example.com","email_verified":true}' \
+  DEFAULT_CLAIMS_GROUPS='{"groups":["admin","developer"]}' \
+    python -c "from app import provider; provider.main()"
+  ```
 
 ## Contributing
 

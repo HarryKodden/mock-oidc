@@ -91,6 +91,89 @@ def test_discovery_and_jwks(running_server):
     assert 'x5c' not in key
 
 
+def test_configured_default_claims_openid_only():
+    claims = provider._configured_default_claims('openid')
+    assert claims == {'sub': '$uuid'}
+
+
+def test_configured_default_claims_merges_scopes():
+    claims = provider._configured_default_claims('openid email profile')
+    assert claims['sub'] == '$uuid'
+    assert claims['email'] == 'user@example.com'
+    assert claims['name'] == 'Example User'
+
+
+def test_empty_scope_defaults_to_openid():
+    claims = provider._configured_default_claims('')
+    assert claims == {'sub': '$uuid'}
+
+
+def test_configured_default_claims_uses_env_json(monkeypatch):
+    monkeypatch.setenv(
+        'DEFAULT_CLAIMS_EMAIL',
+        '{"email":"bob@example.com","email_verified":false}',
+    )
+    claims = provider._configured_default_claims('email')
+    assert claims['email'] == 'bob@example.com'
+    assert claims['email_verified'] is False
+
+
+def test_default_userinfo_expands_uuid_placeholder(monkeypatch):
+    monkeypatch.setenv('DEFAULT_CLAIMS_OPENID', '{"sub":"$uuid"}')
+    info = provider.default_userinfo('openid')
+    assert info['sub'] != '$uuid'
+    assert len(info['sub']) == 36
+
+
+def test_authorize_page_openid_scope_only(running_server):
+    base = running_server
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': 'https://example.com/callback',
+            'response_type': 'code',
+            'scope': 'openid',
+        },
+    )
+    assert r.status_code == 200
+    assert 'user@example.com' not in r.text
+
+
+def test_authorize_page_uses_scope_default_claims(running_server, monkeypatch):
+    monkeypatch.setenv('DEFAULT_CLAIMS_EMAIL', '{"email":"demo@example.com"}')
+    base = running_server
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': 'https://example.com/callback',
+            'response_type': 'code',
+            'scope': 'openid email',
+        },
+    )
+    assert r.status_code == 200
+    assert 'demo@example.com' in r.text
+
+
+def test_device_verify_uses_scope_from_grant(running_server, monkeypatch):
+    monkeypatch.setenv('DEFAULT_CLAIMS_EMAIL', '{"email":"device@example.com"}')
+    base = running_server
+    step = requests.post(
+        f"{base}/device",
+        data={
+            'client_id': provider.CLIENT_ID,
+            'client_secret': provider.CLIENT_SECRET,
+            'scope': 'openid email',
+        },
+    )
+    assert step.status_code == 200
+    user_code = step.json()['user_code']
+    r = requests.get(f"{base}/device/verify", params={'user_code': user_code})
+    assert r.status_code == 200
+    assert 'device@example.com' in r.text
+
+
 def test_pkce_authorization_code_s256(running_server):
     base = running_server
     redirect_uri = 'https://example.com/callback'
