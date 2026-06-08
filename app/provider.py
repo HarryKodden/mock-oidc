@@ -201,6 +201,29 @@ def _configured_default_claims(scopes: str | list[str] | None = None) -> dict:
     return merged
 
 
+def _iter_default_claims_config():
+    """Yield (scope, env_key, claims, source) for startup logging."""
+    seen_env_keys = set()
+    for scope_name in sorted(_BUILTIN_SCOPE_DEFAULT_CLAIMS):
+        env_key = _scope_env_var(scope_name)
+        seen_env_keys.add(env_key)
+        configured = os.getenv(env_key, '').strip()
+        source = env_key if configured else 'built-in'
+        yield scope_name, env_key, _claims_for_scope(scope_name), source
+    for env_key in sorted(os.environ):
+        if not env_key.startswith('DEFAULT_CLAIMS_') or env_key in seen_env_keys:
+            continue
+        scope_label = env_key[len('DEFAULT_CLAIMS_'):].lower()
+        raw = os.environ[env_key].strip()
+        try:
+            claims = json.loads(raw) if raw else {}
+            if not isinstance(claims, dict):
+                claims = {'(error)': 'must be a JSON object'}
+        except json.JSONDecodeError:
+            claims = {'(error)': 'invalid JSON'}
+        yield scope_label, env_key, claims, 'env'
+
+
 def _expand_claim_placeholders(claims: dict) -> dict:
     """Return a copy of claims with '$uuid' string values replaced by fresh UUIDs."""
     out = {}
@@ -2047,12 +2070,9 @@ def main():
     logger.info(f"Client ID: {CLIENT_ID}")
     logger.info(f"Client Secret: {CLIENT_SECRET}")
     logger.info(f"Roles Claim: {ROLES_CLAIM}")
-    logger.info("Default claims per scope (built-in when env unset):")
-    for scope_name in sorted(_BUILTIN_SCOPE_DEFAULT_CLAIMS):
-        env_key = _scope_env_var(scope_name)
-        configured = os.getenv(env_key, '').strip()
-        source = env_key if configured else 'built-in'
-        logger.info(f"  {scope_name}: {json.dumps(_claims_for_scope(scope_name))} ({source})")
+    logger.info("Default claims per scope:")
+    for scope_name, env_key, claims, source in _iter_default_claims_config():
+        logger.info(f"  scope={scope_name!r} {env_key}={json.dumps(claims)} ({source})")
     logger.info(f"Strict client auth: {STRICT_CLIENT_AUTH}")
     logger.info("=" * 50)
     logger.info(f"Root: {ISSUER}/")
@@ -2065,12 +2085,11 @@ def main():
     logger.info(f"Introspection: {ISSUER}/introspect")
     logger.info(f"Device authorization: {ISSUER}/device")
     logger.info(f"Device verify (browser): {ISSUER}/device/verify")
-    logger.info("")
-    logger.info("Configure your .env with:")
-    logger.info(f"  ISSUER={ISSUER}")
-    logger.info(f"  CLIENT_ID={CLIENT_ID}")
-    logger.info(f"  CLIENT_SECRET={CLIENT_SECRET}")
-    logger.info(f"  ROLES_CLAIM={ROLES_CLAIM} (if different)")
+    for _scope, env_key, claims, source in _iter_default_claims_config():
+        if source == 'built-in':
+            logger.info(f"  # {env_key}={json.dumps(claims)}  (built-in; override to customize)")
+        else:
+            logger.info(f"  {env_key}={json.dumps(claims)}")
     logger.info("")
     logger.info("Press Ctrl+C to stop...")
     logger.info("")
