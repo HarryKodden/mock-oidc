@@ -60,6 +60,29 @@ def test_health_and_root(running_server):
     text = root.text.lower()
     assert "mock-oidc" in text
     assert "openid-configuration" in text
+    assert 'scope-cb' in root.text
+    assert 'signinlink' in text.replace('-', '')
+
+
+def test_supported_scopes_and_claims(monkeypatch):
+    monkeypatch.setenv('DEFAULT_CLAIMS_EMAIL', '{"email":"a@example.com","email_verified":true}')
+    scopes = provider.supported_scopes()
+    claims = provider.supported_claims()
+    assert 'openid' in scopes
+    assert 'email' in scopes
+    assert 'sub' in claims
+    assert 'email' in claims
+    assert 'email_verified' in claims
+    assert claims == sorted(claims)
+    assert all(c == c.lower() for c in claims)
+
+
+def test_claim_keys_normalized_to_lowercase(monkeypatch):
+    monkeypatch.setenv('DEFAULT_CLAIMS_PROFILE', '{"Name":"Test","Preferred_Username":"user"}')
+    claims = provider._claims_for_scope('profile')
+    assert 'name' in claims
+    assert 'preferred_username' in claims
+    assert 'Name' not in claims
 
 
 def test_discovery_and_jwks(running_server):
@@ -76,6 +99,10 @@ def test_discovery_and_jwks(running_server):
     assert doc.get('code_challenge_methods_supported') == ['S256', 'plain']
     assert doc.get('introspection_endpoint') == f"{provider.ISSUER}/introspect"
     assert 'refresh_token' in doc.get('grant_types_supported', [])
+    assert doc.get('scopes_supported') == provider.supported_scopes()
+    assert doc.get('claims_supported') == provider.supported_claims()
+    assert 'openid' in doc.get('scopes_supported', [])
+    assert 'sub' in doc.get('claims_supported', [])
 
     # JWKS: RS256 bare key (kty, kid, alg, n, e — no x5c)
     r = requests.get(f"{base}/.well-known/jwks.json")

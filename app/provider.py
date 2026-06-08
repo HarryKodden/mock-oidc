@@ -43,7 +43,7 @@ JWT_SECRET = os.getenv('SECRET', "test-jwt-secret-key-do-not-use-in-production")
 ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
-ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups')
+ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups').lower()
 STRICT_CLIENT_AUTH = os.getenv('STRICT_CLIENT_AUTH', 'true').lower() in ('1','true','yes')
 # Per-scope default claims for login forms: DEFAULT_CLAIMS_<SCOPE> env vars (JSON).
 # Use "$uuid" as a string value to generate a fresh UUID on each form load.
@@ -52,7 +52,7 @@ _BUILTIN_SCOPE_DEFAULT_CLAIMS = {
     'profile': {'name': 'Example User', 'preferred_username': 'user'},
     'email': {'email': 'user@example.com', 'email_verified': True},
 }
-_BUILTIN_SCOPE_DEFAULT_CLAIMS[ROLES_CLAIM.lower()] = {ROLES_CLAIM: ['developer']}
+_BUILTIN_SCOPE_DEFAULT_CLAIMS[ROLES_CLAIM] = {ROLES_CLAIM: ['developer']}
 # Optional base path (when the app is mounted at a subpath behind a reverse proxy)
 BASE_PATH = os.getenv('BASE_PATH', '')
 if BASE_PATH:
@@ -156,6 +156,13 @@ def _verify_pkce(stored_challenge: str, stored_method: str, code_verifier: str) 
     return False
 
 
+def _normalize_claim_keys(claims: dict) -> dict:
+    """Return claims with all keys lowercased."""
+    if not isinstance(claims, dict):
+        return {}
+    return {str(k).lower(): v for k, v in claims.items()}
+
+
 def _parse_scopes(scope: str) -> list[str]:
     """Split an OAuth scope string into individual scope names."""
     return [s for s in (scope or '').split() if s]
@@ -178,11 +185,11 @@ def _claims_for_scope(scope: str) -> dict:
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
-                return parsed
+                return _normalize_claim_keys(parsed)
             logger.warning("%s must be a JSON object; using built-in for scope %r", env_key, scope_key)
         except json.JSONDecodeError as exc:
             logger.warning("Invalid %s JSON (%s); using built-in for scope %r", env_key, exc, scope_key)
-    return dict(_BUILTIN_SCOPE_DEFAULT_CLAIMS.get(scope_key, {}))
+    return _normalize_claim_keys(_BUILTIN_SCOPE_DEFAULT_CLAIMS.get(scope_key, {}))
 
 
 def _configured_default_claims(scopes: str | list[str] | None = None) -> dict:
@@ -214,14 +221,33 @@ def _iter_default_claims_config():
         if not env_key.startswith('DEFAULT_CLAIMS_') or env_key in seen_env_keys:
             continue
         scope_label = env_key[len('DEFAULT_CLAIMS_'):].lower()
-        raw = os.environ[env_key].strip()
-        try:
-            claims = json.loads(raw) if raw else {}
-            if not isinstance(claims, dict):
-                claims = {'(error)': 'must be a JSON object'}
-        except json.JSONDecodeError:
-            claims = {'(error)': 'invalid JSON'}
-        yield scope_label, env_key, claims, 'env'
+        yield scope_label, env_key, _claims_for_scope(scope_label), 'env'
+
+
+def supported_scopes() -> list[str]:
+    """OAuth scopes derived from configured DEFAULT_CLAIMS_<SCOPE> entries."""
+    scopes = []
+    seen = set()
+    for scope_name, _env_key, _claims, _source in _iter_default_claims_config():
+        if scope_name in seen:
+            continue
+        seen.add(scope_name)
+        scopes.append(scope_name)
+    if 'openid' in scopes:
+        scopes.remove('openid')
+        scopes.insert(0, 'openid')
+    return scopes or ['openid']
+
+
+def supported_claims() -> list[str]:
+    """Claim names derived from configured default claims across all scopes."""
+    claims = set()
+    for _scope, _env_key, scope_claims, _source in _iter_default_claims_config():
+        for key in scope_claims:
+            key_l = str(key).lower()
+            if not key_l.startswith('('):
+                claims.add(key_l)
+    return sorted(claims)
 
 
 def _expand_claim_placeholders(claims: dict) -> dict:
@@ -248,7 +274,7 @@ def default_userinfo(scopes: str | list[str] | None = None, overrides: dict | No
     """Default claims for login forms; cookie values take precedence when present."""
     info = _expand_claim_placeholders(_configured_default_claims(scopes))
     if overrides:
-        info.update(overrides)
+        info.update(_normalize_claim_keys(overrides))
     return info
 
 
@@ -264,7 +290,7 @@ def _userinfo_from_cookie(cookie_header: str):
             cookie_val = unquote(kv.split('=', 1)[1])
             parsed = json.loads(cookie_val)
             if isinstance(parsed, dict):
-                return parsed
+                return _normalize_claim_keys(parsed)
         except Exception:
             pass
         break
@@ -703,7 +729,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(userinfo_text)
                 if isinstance(parsed, dict):
-                    custom_claims = parsed.copy()
+                    custom_claims = _normalize_claim_keys(parsed)
                     # extract username/email if present
                     username = parsed.get('email') or parsed.get('sub') or ''
                     # extract groups/roles if present
@@ -951,7 +977,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(userinfo_text)
                 if isinstance(parsed, dict):
-                    custom_claims = parsed.copy()
+                    custom_claims = _normalize_claim_keys(parsed)
                     username = parsed.get('email') or parsed.get('sub') or ''
                     groups = parsed.get('groups') or parsed.get('roles')
                     if isinstance(groups, list):
@@ -1029,6 +1055,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 client_secret=CLIENT_SECRET,
                 issuer=ISSUER,
                 callback_uri=oauth_callback_uri(),
+                supported_scopes=supported_scopes(),
             )
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -1131,6 +1158,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
             "code_challenge_methods_supported": ["S256", "plain"],
+            "scopes_supported": supported_scopes(),
+            "claims_supported": supported_claims(),
         }
 
         self.send_response(200)
@@ -1887,7 +1916,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(userinfo_text)
                 if isinstance(parsed, dict):
-                    custom_claims = parsed.copy()
+                    custom_claims = _normalize_claim_keys(parsed)
                     username = parsed.get('email') or parsed.get('sub') or ''
                     grps = parsed.get('groups') or parsed.get('roles')
                     if isinstance(grps, list):

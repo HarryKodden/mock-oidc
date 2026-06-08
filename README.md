@@ -8,7 +8,7 @@ A small, standalone OpenID Connect (OIDC) test provider for local development an
 ## Features
 
 - **Landing & health** — `GET /` serves a small HTML page with links to discovery, authorize, JWKS, OAuth callback demo, and device-flow helpers. **`GET /callback`** receives the authorization redirect (`redirect_uri={issuer}{BASE_PATH}/callback`), shows tokens, UserInfo, and introspection/refresh helpers (see [Landing page demo](#landing-page-demo)). **`GET /health`** returns JSON (`status`, `issuer`, `version`) for Docker/Kubernetes probes.
-- **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, grant types, **`introspection_endpoint`**, **`code_challenge_methods_supported`** for PKCE).
+- **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, grant types, **`scopes_supported`** and **`claims_supported`** derived from `DEFAULT_CLAIMS_<SCOPE>` configuration, **`introspection_endpoint`**, **`code_challenge_methods_supported`** for PKCE).
 - **Signing** — Access and ID tokens are **RS256** JWTs. **`GET /jwks`** exposes the public key with **`x5c`** (self-signed cert by default) so clients that require RS256/x5c can validate remotely.
 - **Authorization code flow** — `GET/POST /authorize` with a browser form to compose **claims** (JSON-backed rows: `sub`, `email`, `groups`, etc.). Redirects with `code`.
 - **PKCE (RFC 7636)** — Optional on the authorization code flow. Pass **`code_challenge`** (and optionally **`code_challenge_method`**) on `/authorize`; if the challenge is present and the method is omitted, **`S256`** is assumed. Discovery advertises **`S256`** and **`plain`**. Exchange the code at **`POST /token`** with **`code_verifier`** (required when a challenge was used).
@@ -46,7 +46,7 @@ python -c "from app import provider; provider.main()"
 
 ### Landing page demo
 
-- **`GET /`** — Includes an **Authorize** link that uses **`redirect_uri={issuer}{BASE_PATH}/callback`** (must match the value you send to `/authorize` exactly), plus a **device code** section to request `device_code` / `user_code`, open verification URLs, and poll **`POST /token`** until tokens are issued.
+- **`GET /`** — Includes a **Sign in** link with checkboxes to select OAuth **scopes** (defaults to `openid`; always includes `openid`). The chosen scopes are sent as the `scope` parameter on `/authorize` (and on the demo device flow). Uses **`redirect_uri={issuer}{BASE_PATH}/callback`** (must match the value you send to `/authorize` exactly), plus a **device code** section to request `device_code` / `user_code`, open verification URLs, and poll **`POST /token`** until tokens are issued.
 - **`GET /callback`** — After sign-in, the browser returns here with `?code=...&state=...`. The provider exchanges the code **in-process** (no nested HTTP call to `/token`) and renders token JSON, decoded access-token claims, **UserInfo**, and buttons that call **introspection** and **refresh** via `fetch` (demo only: client id/secret are embedded in the page HTML).
 - **PKCE** — If you start `/authorize` **with** `code_challenge`, complete the flow with **`POST /token`** and **`code_verifier`**. The **`/callback`** page only supports **non-PKCE** authorization code exchanges.
 
