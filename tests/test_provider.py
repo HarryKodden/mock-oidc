@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import re
 import secrets
 import threading
 import time
@@ -126,8 +127,10 @@ def test_configured_default_claims_openid_only():
 def test_configured_default_claims_merges_scopes():
     claims = provider._configured_default_claims('openid email profile')
     assert claims['sub'] == '$uuid'
-    assert claims['email'] == 'user@example.com'
-    assert claims['name'] == 'Example User'
+    assert claims['email'] == '$email'
+    assert claims['name'] == '$name'
+    assert claims['given_name'] == '$given_name'
+    assert claims['family_name'] == '$family_name'
 
 
 def test_empty_scope_defaults_to_openid():
@@ -150,6 +153,27 @@ def test_default_userinfo_expands_uuid_placeholder(monkeypatch):
     info = provider.default_userinfo('openid')
     assert info['sub'] != '$uuid'
     assert len(info['sub']) == 36
+
+
+def test_default_userinfo_expands_email_and_name_placeholders(monkeypatch):
+    monkeypatch.setattr(provider, 'DEFAULT_EMAIL_DOMAIN', 'example.com')
+    monkeypatch.setenv(
+        'DEFAULT_CLAIMS_EMAIL',
+        '{"email":"$email","email_verified":true}',
+    )
+    monkeypatch.setenv(
+        'DEFAULT_CLAIMS_PROFILE',
+        '{"name":"$name","given_name":"$given_name","family_name":"$family_name"}',
+    )
+    info = provider.default_userinfo('openid email profile')
+    assert info['email'].endswith('@example.com')
+    assert re.fullmatch(r'[a-z]+-[a-z]+@example\.com', info['email'])
+    local = info['email'].split('@', 1)[0]
+    given, family = local.split('-', 1)
+    assert info['given_name'] == given.capitalize()
+    assert info['family_name'] == family.capitalize()
+    assert info['name'] == f'{given.capitalize()} {family.capitalize()}'
+    assert info['email'] != '$email'
 
 
 def test_authorize_page_openid_scope_only(running_server):

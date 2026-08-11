@@ -46,13 +46,24 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
 ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups').lower()
 STRICT_CLIENT_AUTH = os.getenv('STRICT_CLIENT_AUTH', 'true').lower() in ('1','true','yes')
 # Per-scope default claims for login forms: DEFAULT_CLAIMS_<SCOPE> env vars (JSON).
-# Use "$uuid" as a string value to generate a fresh UUID on each form load.
+# Placeholders: "$uuid" → fresh UUID; "$email" → givenname-surname@domain;
+# "$given_name" / "$family_name" / "$name" → matching name parts for the same person.
 _BUILTIN_SCOPE_DEFAULT_CLAIMS = {
     'openid': {'sub': '$uuid'},
-    'profile': {'name': 'Example User', 'preferred_username': 'user'},
-    'email': {'email': 'user@example.com', 'email_verified': True},
+    'profile': {'name': '$name', 'given_name': '$given_name', 'family_name': '$family_name', 'preferred_username': '$email'},
+    'email': {'email': '$email', 'email_verified': True},
 }
 _BUILTIN_SCOPE_DEFAULT_CLAIMS[ROLES_CLAIM] = {ROLES_CLAIM: ['developer']}
+DEFAULT_EMAIL_DOMAIN = os.getenv('DEFAULT_EMAIL_DOMAIN', 'example.com').strip() or 'example.com'
+_GIVEN_NAMES = (
+    'alice', 'bob', 'carol', 'dave', 'erin', 'frank', 'grace', 'henry', 'ivy', 'jack',
+    'kate', 'leo', 'mia', 'noah', 'olivia', 'paul', 'quinn', 'rosa', 'sam', 'tina',
+)
+_FAMILY_NAMES = (
+    'anderson', 'baker', 'clark', 'davis', 'evans', 'foster', 'garcia', 'harris',
+    'ivanov', 'jones', 'klein', 'lopez', 'martin', 'nguyen', 'owen', 'patel',
+    'quinn', 'reed', 'smith', 'taylor',
+)
 # Optional base path (when the app is mounted at a subpath behind a reverse proxy)
 BASE_PATH = os.getenv('BASE_PATH', '')
 if BASE_PATH:
@@ -250,19 +261,52 @@ def supported_claims() -> list[str]:
     return sorted(claims)
 
 
-def _expand_claim_placeholders(claims: dict) -> dict:
-    """Return a copy of claims with '$uuid' string values replaced by fresh UUIDs."""
+def _random_person() -> dict:
+    """Pick a random given/family name pair used by $email / $name placeholders."""
+    given = secrets.choice(_GIVEN_NAMES)
+    family = secrets.choice(_FAMILY_NAMES)
+    local = f'{given}-{family}'
+    return {
+        'given_name': given.capitalize(),
+        'family_name': family.capitalize(),
+        'name': f'{given.capitalize()} {family.capitalize()}',
+        'email': f'{local}@{DEFAULT_EMAIL_DOMAIN}',
+        'preferred_username': local,
+    }
+
+
+def _expand_placeholder_value(value, person: dict):
+    """Expand a single placeholder string using a shared person + fresh UUIDs."""
+    if value == '$uuid':
+        return str(uuid.uuid4())
+    if value == '$email':
+        return person['email']
+    if value == '$given_name':
+        return person['given_name']
+    if value == '$family_name':
+        return person['family_name']
+    if value == '$name':
+        return person['name']
+    if value == '$preferred_username':
+        return person['preferred_username']
+    return value
+
+
+def _expand_claim_placeholders(claims: dict, person: dict | None = None) -> dict:
+    """Return a copy of claims with placeholders ($uuid, $email, $name, …) expanded."""
+    if person is None:
+        person = _random_person()
     out = {}
     for key, value in claims.items():
-        if value == '$uuid':
-            out[key] = str(uuid.uuid4())
-        elif isinstance(value, dict):
-            out[key] = _expand_claim_placeholders(value)
+        if isinstance(value, dict):
+            out[key] = _expand_claim_placeholders(value, person)
         elif isinstance(value, list):
             out[key] = [
-                str(uuid.uuid4()) if item == '$uuid' else item
+                _expand_placeholder_value(item, person) if isinstance(item, str) else item
                 for item in value
             ]
+        elif isinstance(value, str):
+            out[key] = _expand_placeholder_value(value, person)
         else:
             out[key] = value
     if 'sub' not in out or not out.get('sub'):
