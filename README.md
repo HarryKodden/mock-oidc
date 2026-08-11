@@ -204,7 +204,23 @@ Defaults apply when a variable is unset.
 
 - `SECRET` is reserved in code but **JWTs are not signed with it**; signing uses the RSA key above.
 - Completing `/authorize` sets a cookie `mock_oidc_userinfo` to prefill the next authorize or device verification page.
-- Example custom default claims per scope:
+- **Docker Compose note:** Compose treats `$…` as its own variable substitution. Escape placeholders as `$$uuid`, `$$email`, `$$name`, etc. Example:
+  ```yaml
+  environment:
+    DEFAULT_EMAIL_DOMAIN: example.com
+    DEFAULT_CLAIMS_OPENID: |
+      {"sub": "$$uuid"}
+    DEFAULT_CLAIMS_EMAIL: |
+      {"email": "$$email", "email_verified": true}
+    DEFAULT_CLAIMS_PROFILE: |
+      {
+        "name": "$$name",
+        "given_name": "$$given_name",
+        "family_name": "$$family_name",
+        "preferred_username": "$$given_name-$$family_name"
+      }
+  ```
+- Example custom default claims per scope (shell):
   ```bash
   DEFAULT_CLAIMS_OPENID='{"sub":"$uuid"}' \
   DEFAULT_CLAIMS_EMAIL='{"email":"$email","email_verified":true}' \

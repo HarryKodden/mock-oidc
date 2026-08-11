@@ -276,20 +276,28 @@ def _random_person() -> dict:
 
 
 def _expand_placeholder_value(value, person: dict):
-    """Expand a single placeholder string using a shared person + fresh UUIDs."""
-    if value == '$uuid':
-        return str(uuid.uuid4())
-    if value == '$email':
-        return person['email']
-    if value == '$given_name':
-        return person['given_name']
-    if value == '$family_name':
-        return person['family_name']
-    if value == '$name':
-        return person['name']
-    if value == '$preferred_username':
-        return person['preferred_username']
-    return value
+    """Expand placeholder tokens in a string using a shared person + fresh UUIDs."""
+    if not isinstance(value, str) or '$' not in value:
+        return value
+    # Replace longer names first so $given_name wins over a hypothetical $given
+    replacements = (
+        ('$preferred_username', person['preferred_username']),
+        ('$given_name', person['given_name']),
+        ('$family_name', person['family_name']),
+        ('$email', person['email']),
+        ('$name', person['name']),
+        ('$uuid', str(uuid.uuid4())),
+    )
+    out = value
+    for token, replacement in replacements:
+        if token in out:
+            # Fresh UUID per occurrence when the whole value or a fragment uses $uuid
+            if token == '$uuid':
+                while token in out:
+                    out = out.replace(token, str(uuid.uuid4()), 1)
+            else:
+                out = out.replace(token, replacement)
+    return out
 
 
 def _expand_claim_placeholders(claims: dict, person: dict | None = None) -> dict:

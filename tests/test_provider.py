@@ -163,7 +163,7 @@ def test_default_userinfo_expands_email_and_name_placeholders(monkeypatch):
     )
     monkeypatch.setenv(
         'DEFAULT_CLAIMS_PROFILE',
-        '{"name":"$name","given_name":"$given_name","family_name":"$family_name"}',
+        '{"name":"$name","given_name":"$given_name","family_name":"$family_name","preferred_username":"$given_name-$family_name"}',
     )
     info = provider.default_userinfo('openid email profile')
     assert info['email'].endswith('@example.com')
@@ -173,6 +173,7 @@ def test_default_userinfo_expands_email_and_name_placeholders(monkeypatch):
     assert info['given_name'] == given.capitalize()
     assert info['family_name'] == family.capitalize()
     assert info['name'] == f'{given.capitalize()} {family.capitalize()}'
+    assert info['preferred_username'] == f'{info["given_name"]}-{info["family_name"]}'
     assert info['email'] != '$email'
 
 
