@@ -70,6 +70,7 @@ def test_supported_scopes_and_claims(monkeypatch):
     scopes = provider.supported_scopes()
     claims = provider.supported_claims()
     assert 'openid' in scopes
+    assert 'offline_access' in scopes
     assert 'email' in scopes
     assert 'sub' in claims
     assert 'email' in claims
@@ -103,6 +104,7 @@ def test_discovery_and_jwks(running_server):
     assert doc.get('scopes_supported') == provider.supported_scopes()
     assert doc.get('claims_supported') == provider.supported_claims()
     assert 'openid' in doc.get('scopes_supported', [])
+    assert 'offline_access' in doc.get('scopes_supported', [])
     assert 'sub' in doc.get('claims_supported', [])
 
     # JWKS: RS256 bare key (kty, kid, alg, n, e — no x5c)

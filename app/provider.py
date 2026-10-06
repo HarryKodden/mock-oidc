@@ -50,6 +50,9 @@ STRICT_CLIENT_AUTH = os.getenv('STRICT_CLIENT_AUTH', 'true').lower() in ('1','tr
 # "$given_name" / "$family_name" / "$name" → matching name parts for the same person.
 _BUILTIN_SCOPE_DEFAULT_CLAIMS = {
     'openid': {'sub': '$uuid'},
+    # RFC 6749/OIDC: offline_access indicates consent for refresh tokens.
+    # It is intentionally claimless, but must still be advertised in discovery.
+    'offline_access': {},
     'profile': {'name': '$name', 'given_name': '$given_name', 'family_name': '$family_name', 'preferred_username': '$email'},
     'email': {'email': '$email', 'email_verified': True},
 }
