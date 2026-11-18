@@ -45,6 +45,19 @@ CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
 ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups').lower()
 STRICT_CLIENT_AUTH = os.getenv('STRICT_CLIENT_AUTH', 'true').lower() in ('1','true','yes')
+# Optional fixed audience for access tokens (e.g. MCP resource URL). Empty → aud = client_id.
+ACCESS_TOKEN_AUDIENCE = os.getenv('ACCESS_TOKEN_AUDIENCE', '').strip()
+# RFC 7591 Dynamic Client Registration
+DCR_ENABLED = os.getenv('DCR_ENABLED', 'true').lower() in ('1', 'true', 'yes')
+# Comma-separated redirect URI allowlist for DCR. Empty → Cursor defaults + demo /callback.
+_DCR_REDIRECT_ENV = os.getenv('DCR_ALLOWED_REDIRECT_URIS', '').strip()
+# If true, accept any redirect_uri in registration (still useful for local mocks).
+DCR_ALLOW_ANY_REDIRECT = os.getenv('DCR_ALLOW_ANY_REDIRECT', 'false').lower() in ('1', 'true', 'yes')
+# Cursor MCP OAuth callback URIs (minimum useful DCR surface).
+_CURSOR_REDIRECT_URIS = (
+    'http://localhost:8787/callback',
+    'https://www.cursor.com/agents/mcp/oauth/callback',
+)
 # Per-scope default claims for login forms: DEFAULT_CLAIMS_<SCOPE> env vars (JSON).
 # Placeholders: "$uuid" → fresh UUID; "$email" → givenname-surname@domain;
 # "$given_name" / "$family_name" / "$name" → matching name parts for the same person.
@@ -126,6 +139,38 @@ def public_url(path: str) -> str:
 def oauth_callback_uri() -> str:
     """OAuth redirect_uri for the demo /callback page (must match authorize exactly)."""
     return public_url('/callback')
+
+
+def dcr_allowed_redirect_uris() -> list[str]:
+    """Redirect URIs accepted by Dynamic Client Registration."""
+    if _DCR_REDIRECT_ENV:
+        return [u.strip() for u in _DCR_REDIRECT_ENV.split(',') if u.strip()]
+    uris = list(_CURSOR_REDIRECT_URIS)
+    demo = oauth_callback_uri()
+    if demo not in uris:
+        uris.append(demo)
+    return uris
+
+
+def resolve_access_token_audience(client_id: str) -> str:
+    """aud claim: ACCESS_TOKEN_AUDIENCE when set, otherwise the initiating client_id."""
+    return ACCESS_TOKEN_AUDIENCE or client_id or CLIENT_ID
+
+
+def _normalize_scope_string(scope: str | None) -> str:
+    """Return a normalized space-separated scope string (empty if none)."""
+    return ' '.join(_parse_scopes(scope or ''))
+
+
+def should_issue_refresh_token(scope: str | None) -> bool:
+    """
+    Issue refresh tokens when offline_access is granted.
+    When no scope was requested (legacy/demo flows), keep issuing refresh for compatibility.
+    """
+    scopes = _parse_scopes(scope or '')
+    if not scopes:
+        return True
+    return 'offline_access' in scopes
 
 
 # RFC 8628 device flow: poll interval (seconds); set to 0 in tests to skip slow_down
@@ -449,6 +494,100 @@ USER_CODE_INDEX = {}
 REFRESH_TOKENS = {}
 # pam-weblogin sessions: session_id -> session record
 PAM_SESSIONS = {}
+# RFC 7591 dynamically registered clients: client_id -> registration record
+REGISTERED_CLIENTS = {}
+
+
+def get_client(client_id: str):
+    """Return static or dynamically registered client metadata, or None."""
+    if not client_id:
+        return None
+    if client_id == CLIENT_ID:
+        return {
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'token_endpoint_auth_method': 'client_secret_post',
+            'redirect_uris': None,  # static mock client: any redirect_uri accepted
+            'grant_types': [
+                'authorization_code',
+                'refresh_token',
+                'client_credentials',
+                'urn:ietf:params:oauth:grant-type:device_code',
+            ],
+            'response_types': ['code'],
+            'client_name': 'static',
+        }
+    return REGISTERED_CLIENTS.get(client_id)
+
+
+def is_public_client(client: dict | None) -> bool:
+    """True when token_endpoint_auth_method is none (public / PKCE client)."""
+    if not client:
+        return False
+    return (client.get('token_endpoint_auth_method') or '') == 'none'
+
+
+def client_redirect_allowed(client: dict | None, redirect_uri: str) -> bool:
+    """Validate redirect_uri against registered client allowlist (static client: any)."""
+    if not redirect_uri:
+        return False
+    if not client:
+        return False
+    allowed = client.get('redirect_uris')
+    if allowed is None:
+        return True
+    return redirect_uri in allowed
+
+
+def _authenticate_client(handler, params, *, optional_secret: bool = False) -> tuple[dict | None, str | None]:
+    """
+    Resolve and authenticate the OAuth client from Basic auth or form params.
+    Returns (client, error_code). error_code is set on failure.
+    Public clients (auth method none) need only a known client_id.
+    optional_secret: when True, confidential clients may omit the secret (mock
+    leniency for legacy authorization_code exchanges that only send the code).
+    """
+    auth_header = handler.headers.get('Authorization', '')
+    client_id = None
+    client_secret = None
+
+    if auth_header.startswith('Basic '):
+        try:
+            credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+            client_id, client_secret = credentials.split(':', 1)
+        except Exception:
+            return None, 'invalid_client'
+    else:
+        client_id = params.get('client_id', [''])[0]
+        client_secret = params.get('client_secret', [''])[0]
+
+    if not client_id:
+        return None, 'invalid_client'
+
+    client = get_client(client_id)
+    if client is None:
+        if not STRICT_CLIENT_AUTH:
+            # Permissive mode: synthesize an unknown confidential-style client
+            return {
+                'client_id': client_id,
+                'client_secret': client_secret or '',
+                'token_endpoint_auth_method': 'client_secret_post',
+                'redirect_uris': None,
+            }, None
+        return None, 'invalid_client'
+
+    if is_public_client(client):
+        return client, None
+
+    if not STRICT_CLIENT_AUTH:
+        return client, None
+
+    expected = client.get('client_secret') or ''
+    if optional_secret and not client_secret:
+        return client, None
+    if not client_secret or not secrets.compare_digest(client_secret, expected):
+        return None, 'invalid_client'
+    return client, None
 
 
 def _scope_from_device_user_code(user_code: str) -> str:
@@ -460,10 +599,20 @@ def _scope_from_device_user_code(user_code: str) -> str:
     return ''
 
 
-def build_token_response(user_email, audience, user_roles, custom_claims, issue_refresh, client_ip_log):
+def build_token_response(
+    user_email,
+    client_id,
+    user_roles,
+    custom_claims,
+    issue_refresh,
+    client_ip_log,
+    scope: str = '',
+):
     """Issue access/id token (+ optional refresh). Mutates TOKEN_DATA / REFRESH_TOKENS. Returns JSON dict."""
     now_tok = datetime.now(timezone.utc)
     ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
+    audience = resolve_access_token_audience(client_id)
+    scope_str = _normalize_scope_string(scope)
     payload = {
         "iss": ISSUER,
         "sub": user_email,
@@ -472,7 +621,10 @@ def build_token_response(user_email, audience, user_roles, custom_claims, issue_
         "iat": int(now_tok.timestamp()),
         "email": user_email,
         ROLES_CLAIM: user_roles,
+        "client_id": client_id,
     }
+    if scope_str:
+        payload["scope"] = scope_str
     payload.update(custom_claims)
 
     token = jwt.encode(
@@ -485,6 +637,8 @@ def build_token_response(user_email, audience, user_roles, custom_claims, issue_
         'email': user_email,
         'roles': user_roles,
         'sub': user_email,
+        'scope': scope_str,
+        'client_id': client_id,
         'expires': now_tok + ttl
     }
     TOKEN_DATA[token].update(custom_claims)
@@ -497,16 +651,19 @@ def build_token_response(user_email, audience, user_roles, custom_claims, issue_
         "expires_in": ACCESS_TOKEN_TTL_SEC,
         "id_token": token,
     }
+    if scope_str:
+        response["scope"] = scope_str
 
     if issue_refresh:
         rt = secrets.token_urlsafe(48)
         cc_store = dict(custom_claims) if isinstance(custom_claims, dict) else {}
         REFRESH_TOKENS[rt] = {
-            'client_id': audience,
+            'client_id': client_id,
             'audience': audience,
             'user_email': user_email,
             'user_roles': user_roles,
             'custom_claims': cc_store,
+            'scope': scope_str,
             'expires': now_tok + timedelta(seconds=REFRESH_TOKEN_TTL_SEC),
         }
         response["refresh_token"] = rt
@@ -528,7 +685,6 @@ def redeem_authorization_code_for_callback(code: str, redirect_uri: str):
     if code_data.get('redirect_uri') != redirect_uri:
         raise ValueError("invalid_grant")
     stored_challenge = code_data.get('code_challenge', '')
-    stored_method = code_data.get('code_challenge_method', '')
     if stored_challenge:
         raise ValueError(
             "PKCE was used on authorize; exchange tokens from your client with code_verifier "
@@ -541,10 +697,13 @@ def redeem_authorization_code_for_callback(code: str, redirect_uri: str):
     if isinstance(custom_claims, dict):
         user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
     user_roles = code_data.get('roles', [''])
-    audience = code_data.get('client_id', CLIENT_ID)
+    client_id = code_data.get('client_id', CLIENT_ID)
+    scope = code_data.get('scope', '') or ''
+    issue_refresh = should_issue_refresh_token(scope)
 
     response = build_token_response(
-        user_email, audience, user_roles, custom_claims, True, 'oauth-callback'
+        user_email, client_id, user_roles, custom_claims, issue_refresh, 'oauth-callback',
+        scope=scope,
     )
     at = response['access_token']
     payload = jwt.decode(at, RSA_PUBLIC_KEY, algorithms=['RS256'], options={'verify_aud': False})
@@ -554,7 +713,7 @@ def redeem_authorization_code_for_callback(code: str, redirect_uri: str):
         ROLES_CLAIM: payload.get(ROLES_CLAIM, []),
     }
     for key, value in payload.items():
-        if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', ROLES_CLAIM]:
+        if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', 'scope', 'client_id', ROLES_CLAIM]:
             userinfo[key] = value
     return response, userinfo
 
@@ -640,6 +799,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.handle_oauth_callback()
         elif parsed_path.path == '/.well-known/openid-configuration':
             self.send_discovery_document()
+        elif parsed_path.path == '/.well-known/oauth-authorization-server':
+            self.send_oauth_authorization_server_metadata()
         elif parsed_path.path == '/authorize':
             self.handle_authorize()
         elif parsed_path.path == '/userinfo':
@@ -685,6 +846,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_token()
         elif parsed_path.path == '/introspect':
             self.send_introspect()
+        elif parsed_path.path == '/register':
+            self.handle_client_registration()
         elif parsed_path.path == '/authorize':
             self.handle_authorize_post()
         elif parsed_path.path == '/device':
@@ -704,6 +867,35 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"error": "not_found"}).encode())
+
+    def do_OPTIONS(self):
+        """CORS preflight for discovery / registration / token."""
+        parsed_path = urlparse(self.path)
+        orig_path = parsed_path.path
+        if BASE_PATH and orig_path.startswith(BASE_PATH):
+            routed_path = orig_path[len(BASE_PATH):] or '/'
+        else:
+            routed_path = orig_path
+        allowed = {
+            '/.well-known/openid-configuration',
+            '/.well-known/oauth-authorization-server',
+            '/.well-known/jwks.json',
+            '/register',
+            '/token',
+            '/authorize',
+            '/userinfo',
+            '/introspect',
+        }
+        if routed_path in allowed:
+            self.send_response(204)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+            self.send_header('Access-Control-Max-Age', '86400')
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
     
     def handle_authorize(self):
         """Handle authorization request - show login form"""
@@ -733,6 +925,30 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"error": "invalid_request"}).encode())
             return
+
+        client = get_client(client_id)
+        if client_id and client is None and STRICT_CLIENT_AUTH:
+            logger.error(f"Unknown client_id in authorization request from {client_ip}: {client_id}")
+            self._send_json_error(400, {"error": "invalid_client", "error_description": "unknown client_id"})
+            return
+        if client and not client_redirect_allowed(client, redirect_uri):
+            logger.error(f"redirect_uri not allowed for client {client_id} from {client_ip}")
+            self._send_json_error(400, {
+                "error": "invalid_request",
+                "error_description": "redirect_uri not registered for this client",
+            })
+            return
+
+        # Public / DCR clients must use PKCE S256
+        if is_public_client(client):
+            method = (code_challenge_method or '').upper()
+            if not code_challenge or method != 'S256':
+                logger.error(f"Public client requires PKCE S256 from {client_ip}")
+                self._send_json_error(400, {
+                    "error": "invalid_request",
+                    "error_description": "public clients must use PKCE with code_challenge_method=S256",
+                })
+                return
         
         saved_userinfo = resolve_form_userinfo(self.headers.get('Cookie', ''), scopes=scope)
 
@@ -817,8 +1033,28 @@ class OIDCHandler(BaseHTTPRequestHandler):
             state = post_params.get('state', [''])[0]
             code_challenge = post_params.get('code_challenge', [''])[0]
             code_challenge_method = post_params.get('code_challenge_method', [''])[0]
+            scope = post_params.get('scope', [''])[0]
             if code_challenge and not code_challenge_method:
                 code_challenge_method = "S256"
+
+            client = get_client(client_id)
+            if client_id and client is None and STRICT_CLIENT_AUTH:
+                self._send_json_error(400, {"error": "invalid_client", "error_description": "unknown client_id"})
+                return
+            if client and not client_redirect_allowed(client, redirect_uri):
+                self._send_json_error(400, {
+                    "error": "invalid_request",
+                    "error_description": "redirect_uri not registered for this client",
+                })
+                return
+            if is_public_client(client):
+                method = (code_challenge_method or '').upper()
+                if not code_challenge or method != 'S256':
+                    self._send_json_error(400, {
+                        "error": "invalid_request",
+                        "error_description": "public clients must use PKCE with code_challenge_method=S256",
+                    })
+                    return
 
             # Generate authorization code
             auth_code = secrets.token_urlsafe(32)
@@ -829,6 +1065,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 'redirect_uri': redirect_uri,
                 'code_challenge': code_challenge,
                 'code_challenge_method': code_challenge_method,
+                'scope': scope,
                 'username': username,
                 'roles': roles,
                 'custom_claims': custom_claims,
@@ -890,24 +1127,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, {"error": "invalid_request", "error_description": "client_id required"})
             return
 
-        if STRICT_CLIENT_AUTH:
-            auth_header = self.headers.get('Authorization', '')
-            if auth_header.startswith('Basic '):
-                try:
-                    credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                    cid, csec = credentials.split(':', 1)
-                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                        self._send_json_error(401, {"error": "invalid_client"})
-                        return
-                except Exception:
-                    self._send_json_error(401, {"error": "invalid_client"})
-                    return
-            else:
-                cid = params.get('client_id', [''])[0]
-                csec = params.get('client_secret', [''])[0]
-                if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                    self._send_json_error(401, {"error": "invalid_client"})
-                    return
+        client, auth_err = _authenticate_client(self, params)
+        if auth_err:
+            self._send_json_error(401, {"error": auth_err})
+            return
+        client_id = client.get('client_id') or client_id
 
         user_code = None
         for _ in range(32):
@@ -1190,12 +1414,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"<html><body>callback error</body></html>")
 
-    def send_discovery_document(self):
-        """Send OpenID Connect discovery document"""
-        client_ip = self.client_address[0] if self.client_address else 'unknown'
-        logger.info(f"Discovery document requested from {client_ip}")
-
-        discovery = {
+    def _oauth_server_metadata(self) -> dict:
+        """Shared OAuth/OIDC authorization server metadata (RFC 8414 + OIDC discovery)."""
+        meta = {
             "issuer": ISSUER,
             "authorization_endpoint": public_url("/authorize"),
             "token_endpoint": public_url("/token"),
@@ -1212,17 +1433,141 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "introspection_endpoint": public_url("/introspect"),
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
+            "token_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+                "none",
+            ],
             "code_challenge_methods_supported": ["S256", "plain"],
             "scopes_supported": supported_scopes(),
             "claims_supported": supported_claims(),
         }
+        if DCR_ENABLED:
+            meta["registration_endpoint"] = public_url("/register")
+        return meta
 
+    def send_discovery_document(self):
+        """Send OpenID Connect discovery document"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"Discovery document requested from {client_ip}")
+        discovery = self._oauth_server_metadata()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps(discovery, indent=2).encode())
-    
+
+    def send_oauth_authorization_server_metadata(self):
+        """RFC 8414 OAuth 2.0 Authorization Server Metadata (used by MCP/Cursor AS discovery)."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"OAuth authorization server metadata requested from {client_ip}")
+        meta = self._oauth_server_metadata()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(meta, indent=2).encode())
+
+    def handle_client_registration(self):
+        """RFC 7591 Dynamic Client Registration — public clients (auth method none)."""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        if not DCR_ENABLED:
+            self._send_json_error(404, {"error": "not_found", "error_description": "registration disabled"})
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(content_length) if content_length else b'{}'
+        try:
+            body = json.loads(raw.decode('utf-8') or '{}')
+            if not isinstance(body, dict):
+                raise ValueError('body must be a JSON object')
+        except Exception as exc:
+            logger.warning(f"DCR invalid JSON from {client_ip}: {exc}")
+            self._send_json_error(400, {"error": "invalid_client_metadata", "error_description": "invalid JSON body"})
+            return
+
+        redirect_uris = body.get('redirect_uris')
+        if redirect_uris is None:
+            redirect_uris = list(_CURSOR_REDIRECT_URIS)
+        if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) and u for u in redirect_uris):
+            self._send_json_error(400, {
+                "error": "invalid_redirect_uri",
+                "error_description": "redirect_uris must be a non-empty array of strings",
+            })
+            return
+
+        if not DCR_ALLOW_ANY_REDIRECT:
+            allowed = set(dcr_allowed_redirect_uris())
+            bad = [u for u in redirect_uris if u not in allowed]
+            if bad:
+                self._send_json_error(400, {
+                    "error": "invalid_redirect_uri",
+                    "error_description": f"redirect_uri not allowed: {bad[0]}",
+                })
+                return
+
+        auth_method = body.get('token_endpoint_auth_method', 'none')
+        if auth_method not in ('none', 'client_secret_post', 'client_secret_basic'):
+            self._send_json_error(400, {
+                "error": "invalid_client_metadata",
+                "error_description": "unsupported token_endpoint_auth_method",
+            })
+            return
+
+        grant_types = body.get('grant_types') or ['authorization_code', 'refresh_token']
+        if not isinstance(grant_types, list):
+            self._send_json_error(400, {"error": "invalid_client_metadata", "error_description": "grant_types must be an array"})
+            return
+        response_types = body.get('response_types') or ['code']
+        if not isinstance(response_types, list):
+            self._send_json_error(400, {"error": "invalid_client_metadata", "error_description": "response_types must be an array"})
+            return
+
+        client_id = secrets.token_urlsafe(24)
+        client_secret = None
+        if auth_method != 'none':
+            client_secret = secrets.token_urlsafe(32)
+
+        record = {
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'client_id_issued_at': int(datetime.now(timezone.utc).timestamp()),
+            'client_name': body.get('client_name') or '',
+            'redirect_uris': list(redirect_uris),
+            'token_endpoint_auth_method': auth_method,
+            'grant_types': list(grant_types),
+            'response_types': list(response_types),
+            'scope': body.get('scope') or ' '.join(supported_scopes()),
+        }
+        REGISTERED_CLIENTS[client_id] = record
+        logger.info(
+            f"DCR registered client {client_id} auth={auth_method} "
+            f"redirects={redirect_uris} from {client_ip}"
+        )
+
+        response = {
+            "client_id": client_id,
+            "client_id_issued_at": record['client_id_issued_at'],
+            "client_name": record['client_name'],
+            "redirect_uris": record['redirect_uris'],
+            "token_endpoint_auth_method": auth_method,
+            "grant_types": record['grant_types'],
+            "response_types": record['response_types'],
+            "scope": record['scope'],
+        }
+        if client_secret is not None:
+            response["client_secret"] = client_secret
+
+        body_bytes = json.dumps(response).encode()
+        self.send_response(201)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
     def send_token(self):
         """Send access token and ID token"""
         client_ip = self.client_address[0] if self.client_address else 'unknown'
@@ -1236,6 +1581,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
         logger.info(f"Token request from {client_ip} - grant_type: {grant_type}")
 
         issue_refresh = False
+        scope = ''
+        client_id = params.get('client_id', [''])[0] or CLIENT_ID
 
         if grant_type == 'authorization_code':
             # Handle authorization code flow
@@ -1251,6 +1598,15 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 return
 
             code_data = AUTH_CODES[code]
+            # Prefer client_id from the auth code for public-client PKCE exchanges
+            if not params.get('client_id', [''])[0]:
+                params = dict(params)
+                params['client_id'] = [code_data.get('client_id', CLIENT_ID)]
+
+            client, auth_err = _authenticate_client(self, params, optional_secret=True)
+            if auth_err:
+                self._send_json_error(401, {"error": auth_err})
+                return
 
             # Check if code is expired
             if datetime.now(timezone.utc) > code_data['expires']:
@@ -1263,27 +1619,35 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "expired_token"}).encode())
                 return
 
+            redirect_uri = params.get('redirect_uri', [''])[0]
+            if redirect_uri and code_data.get('redirect_uri') and redirect_uri != code_data.get('redirect_uri'):
+                self._send_json_error(400, {"error": "invalid_grant", "error_description": "redirect_uri mismatch"})
+                return
+
+            code_client = code_data.get('client_id', CLIENT_ID)
+            if client.get('client_id') != code_client:
+                self._send_json_error(400, {"error": "invalid_grant", "error_description": "client_id mismatch"})
+                return
+
             # Validate PKCE (RFC 7636) when code_challenge was used at authorize
             code_verifier = params.get('code_verifier', [''])[0]
             stored_challenge = code_data.get('code_challenge', '')
             stored_method = code_data.get('code_challenge_method', '')
 
-            if stored_challenge:
+            if is_public_client(client) or stored_challenge:
                 if not code_verifier:
                     logger.error(f"PKCE validation failed from {client_ip}: missing code_verifier")
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
+                    self._send_json_error(400, {"error": "invalid_grant", "error_description": "code_verifier required"})
                     return
-                if not _verify_pkce(stored_challenge, stored_method, code_verifier):
+                if not stored_challenge or not _verify_pkce(stored_challenge, stored_method, code_verifier):
                     logger.error(f"PKCE validation failed from {client_ip}: verifier does not match challenge")
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
+                    self._send_json_error(400, {"error": "invalid_grant"})
+                    return
+                if is_public_client(client) and (stored_method or 'S256').upper() != 'S256':
+                    self._send_json_error(400, {
+                        "error": "invalid_grant",
+                        "error_description": "public clients require PKCE S256",
+                    })
                     return
 
             # Remove used code
@@ -1296,74 +1660,33 @@ class OIDCHandler(BaseHTTPRequestHandler):
             if isinstance(custom_claims, dict):
                 user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
             user_roles = code_data.get('roles', [''])
-            audience = code_data.get('client_id', CLIENT_ID)
-            logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles}")
-            issue_refresh = True
+            client_id = code_client
+            scope = code_data.get('scope', '') or ''
+            logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles} scope={scope!r}")
+            issue_refresh = should_issue_refresh_token(scope)
 
         elif grant_type == 'client_credentials':
             # Handle client credentials flow
             logger.info(f"Client credentials token request from {client_ip}")
 
-            # Validate client credentials
-            auth_header = self.headers.get('Authorization', '')
-            # If STRICT_CLIENT_AUTH is enabled, validate client_id/client_secret strictly.
-            client_id = None
-            client_secret = None
-            if STRICT_CLIENT_AUTH:
-                if not auth_header.startswith('Basic '):
-                    # Check if client_id and client_secret are in form parameters
-                    client_id = params.get('client_id', [''])[0]
-                    client_secret = params.get('client_secret', [''])[0]
+            client, auth_err = _authenticate_client(self, params)
+            if auth_err:
+                self._send_json_error(401, {"error": auth_err})
+                return
+            if is_public_client(client):
+                self._send_json_error(401, {
+                    "error": "invalid_client",
+                    "error_description": "public clients cannot use client_credentials",
+                })
+                return
 
-                    if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
-                        logger.error(f"Invalid client credentials from {client_ip} - form params")
-                        self.send_response(401)
-                        self.send_header('Content-Type', 'application/json')
-                        self.send_header('Access-Control-Allow-Origin', '*')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
-                        return
-                else:
-                    # Decode Basic auth
-                    import base64
-                    try:
-                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                        client_id, client_secret = credentials.split(':', 1)
-
-                        if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
-                            logger.error(f"Invalid client credentials from {client_ip} - basic auth")
-                            self.send_response(401)
-                            self.send_header('Content-Type', 'application/json')
-                            self.send_header('Access-Control-Allow-Origin', '*')
-                            self.end_headers()
-                            self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
-                            return
-                    except Exception:
-                        logger.error(f"Failed to decode basic auth from {client_ip}")
-                        self.send_response(401)
-                        self.send_header('Content-Type', 'application/json')
-                        self.send_header('Access-Control-Allow-Origin', '*')
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
-                        return
-            else:
-                # permissive mode: accept any provided client_id/secret
-                if auth_header.startswith('Basic '):
-                    import base64
-                    try:
-                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                        client_id, client_secret = credentials.split(':', 1)
-                    except Exception:
-                        client_id = None
-                        client_secret = None
-                else:
-                    client_id = params.get('client_id', [''])[0]
-                    client_secret = params.get('client_secret', [''])[0]
+            client_id = client.get('client_id') or CLIENT_ID
 
             # Set user data for client credentials
-            user_email = CLIENT_ID
+            user_email = client_id
             user_roles = [""]
             custom_claims = {}
+            scope = params.get('scope', [''])[0]
 
             # Parse all form parameters for custom claims
             for param_name, param_values in params.items():
@@ -1388,34 +1711,24 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 user_email = custom_claims['email']
                 del custom_claims['email']  # Remove from custom claims since it's handled separately
 
-            audience = client_id or params.get('client_id', [''])[0] or CLIENT_ID
             logger.info(f"Client credentials token issued for {user_email} from {client_ip} - roles: {user_roles}")
 
         elif grant_type == 'refresh_token':
             refresh_token = params.get('refresh_token', [''])[0]
-            client_id = params.get('client_id', [''])[0]
-            if not refresh_token or not client_id:
-                self._send_json_error(400, {"error": "invalid_request", "error_description": "refresh_token and client_id required"})
+            if not refresh_token:
+                self._send_json_error(400, {"error": "invalid_request", "error_description": "refresh_token required"})
                 return
 
-            if STRICT_CLIENT_AUTH:
-                auth_header = self.headers.get('Authorization', '')
-                if auth_header.startswith('Basic '):
-                    try:
-                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                        cid, csec = credentials.split(':', 1)
-                        if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                            self._send_json_error(401, {"error": "invalid_client"})
-                            return
-                    except Exception:
-                        self._send_json_error(401, {"error": "invalid_client"})
-                        return
-                else:
-                    cid = params.get('client_id', [''])[0]
-                    csec = params.get('client_secret', [''])[0]
-                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                        self._send_json_error(401, {"error": "invalid_client"})
-                        return
+            client, auth_err = _authenticate_client(self, params)
+            if auth_err:
+                # refresh requires client_id; public clients authenticate with client_id only
+                if not params.get('client_id', [''])[0]:
+                    self._send_json_error(400, {"error": "invalid_request", "error_description": "refresh_token and client_id required"})
+                    return
+                self._send_json_error(401, {"error": auth_err})
+                return
+
+            client_id = client.get('client_id')
 
             rec = REFRESH_TOKENS.get(refresh_token)
             now_rt = datetime.now(timezone.utc)
@@ -1435,36 +1748,32 @@ class OIDCHandler(BaseHTTPRequestHandler):
             user_email = rec['user_email']
             user_roles = rec['user_roles']
             custom_claims = dict(rec.get('custom_claims') or {})
-            audience = rec.get('audience', CLIENT_ID)
+            scope = rec.get('scope', '') or ''
+            # Optional down-scope on refresh
+            requested = params.get('scope', [''])[0]
+            if requested:
+                granted = set(_parse_scopes(scope))
+                asked = _parse_scopes(requested)
+                if asked and all(s in granted for s in asked):
+                    scope = ' '.join(asked)
             logger.info(f"Refresh token exchanged for {user_email} from {client_ip}")
             issue_refresh = True
 
         elif grant_type == 'urn:ietf:params:oauth:grant-type:device_code':
             # RFC 8628 device authorization grant
             device_code = params.get('device_code', [''])[0]
-            client_id = params.get('client_id', [''])[0]
-            if not device_code or not client_id:
+            if not device_code:
                 self._send_json_error(400, {"error": "invalid_request", "error_description": "device_code and client_id required"})
                 return
 
-            if STRICT_CLIENT_AUTH:
-                auth_header = self.headers.get('Authorization', '')
-                if auth_header.startswith('Basic '):
-                    try:
-                        credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                        cid, csec = credentials.split(':', 1)
-                        if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                            self._send_json_error(401, {"error": "invalid_client"})
-                            return
-                    except Exception:
-                        self._send_json_error(401, {"error": "invalid_client"})
-                        return
-                else:
-                    cid = params.get('client_id', [''])[0]
-                    csec = params.get('client_secret', [''])[0]
-                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                        self._send_json_error(401, {"error": "invalid_client"})
-                        return
+            client, auth_err = _authenticate_client(self, params)
+            if auth_err:
+                if not params.get('client_id', [''])[0]:
+                    self._send_json_error(400, {"error": "invalid_request", "error_description": "device_code and client_id required"})
+                    return
+                self._send_json_error(401, {"error": auth_err})
+                return
+            client_id = client.get('client_id')
 
             grant = DEVICE_GRANTS.get(device_code)
             if not grant:
@@ -1507,10 +1816,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
             if isinstance(custom_claims, dict):
                 user_email = custom_claims.get('email') or custom_claims.get('sub') or user_email
             user_roles = grant.get('roles', [''])
-            audience = grant.get('client_id', CLIENT_ID)
+            client_id = grant.get('client_id', CLIENT_ID)
+            scope = grant.get('scope', '') or ''
             DEVICE_GRANTS.pop(device_code, None)
             logger.info(f"Device code exchanged for token for {user_email} from {client_ip}")
-            issue_refresh = True
+            issue_refresh = should_issue_refresh_token(scope)
 
         else:
             logger.error(f"Unsupported grant type from {client_ip}: {grant_type}")
@@ -1522,7 +1832,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             return
 
         response = build_token_response(
-            user_email, audience, user_roles, custom_claims, issue_refresh, client_ip
+            user_email, client_id, user_roles, custom_claims, issue_refresh, client_ip,
+            scope=scope,
         )
 
         self.send_response(200)
@@ -1575,9 +1886,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 ROLES_CLAIM: payload.get(ROLES_CLAIM, []),
             }
 
-            # Add any custom claims from the token
+            # Add any custom claims from the token (omit OAuth/JWT housekeeping)
+            _skip = {'iss', 'sub', 'aud', 'exp', 'iat', 'nbf', 'jti', 'email', 'scope', 'client_id', ROLES_CLAIM}
             for key, value in payload.items():
-                if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', ROLES_CLAIM]:
+                if key not in _skip:
                     userinfo[key] = value
 
         except jwt.ExpiredSignatureError:
@@ -1625,24 +1937,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, {"error": "invalid_request", "error_description": "token required"})
             return
 
-        if STRICT_CLIENT_AUTH:
-            auth_header = self.headers.get('Authorization', '')
-            if auth_header.startswith('Basic '):
-                try:
-                    credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
-                    cid, csec = credentials.split(':', 1)
-                    if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                        self._send_json_error(401, {"error": "invalid_client"})
-                        return
-                except Exception:
-                    self._send_json_error(401, {"error": "invalid_client"})
-                    return
-            else:
-                cid = params.get('client_id', [''])[0]
-                csec = params.get('client_secret', [''])[0]
-                if cid != CLIENT_ID or csec != CLIENT_SECRET:
-                    self._send_json_error(401, {"error": "invalid_client"})
-                    return
+        client, auth_err = _authenticate_client(self, params)
+        if auth_err:
+            self._send_json_error(401, {"error": auth_err})
+            return
 
         now = datetime.now(timezone.utc)
 
@@ -1661,6 +1959,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
                     "sub": rec.get('user_email'),
                     "exp": exp,
                 }
+                if rec.get('scope'):
+                    body['scope'] = rec['scope']
         else:
             try:
                 payload = jwt.decode(
@@ -1677,12 +1977,15 @@ class OIDCHandler(BaseHTTPRequestHandler):
                     body = {
                         "active": True,
                         "token_type": "access_token",
-                        "client_id": aud,
+                        "client_id": payload.get('client_id') or aud,
                         "username": payload.get('email') or payload.get('sub'),
                         "sub": payload.get('sub'),
                         "exp": exp,
                         "iss": payload.get('iss'),
+                        "aud": aud,
                     }
+                    if payload.get('scope'):
+                        body['scope'] = payload['scope']
             except jwt.InvalidTokenError:
                 body = {"active": False}
 
@@ -1718,19 +2021,24 @@ class OIDCHandler(BaseHTTPRequestHandler):
         
         logger.info(f"Test token requested for user '{username}' with groups {groups} from {client_ip}")
         
-        # Generate token with specified groups (aud = client_id from query or default)
+        # Generate token with specified groups (aud = ACCESS_TOKEN_AUDIENCE or client_id)
         now = datetime.now(timezone.utc)
         ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
         aud_client = params.get('client_id', [CLIENT_ID])[0] or CLIENT_ID
+        scope = params.get('scope', [''])[0]
+        scope_str = _normalize_scope_string(scope)
         payload = {
             "iss": ISSUER,
             "sub": username,
-            "aud": aud_client,
+            "aud": resolve_access_token_audience(aud_client),
+            "client_id": aud_client,
             "email": username,
             "exp": int((now + ttl).timestamp()),
             "iat": int(now.timestamp()),
             "groups": groups  # OIDC standard claim; use SCIM group IDs
         }
+        if scope_str:
+            payload["scope"] = scope_str
         
         token = jwt.encode(
             payload, RSA_PRIVATE_KEY, algorithm="RS256",
@@ -2158,11 +2466,18 @@ def main():
     for scope_name, env_key, claims, source in _iter_default_claims_config():
         logger.info(f"  scope={scope_name!r} {env_key}={json.dumps(claims)} ({source})")
     logger.info(f"Strict client auth: {STRICT_CLIENT_AUTH}")
+    logger.info(f"Access token audience: {ACCESS_TOKEN_AUDIENCE or '(client_id)'}")
+    logger.info(f"DCR enabled: {DCR_ENABLED}")
+    if DCR_ENABLED:
+        logger.info(f"DCR allowed redirect URIs: {dcr_allowed_redirect_uris()}")
     logger.info("=" * 50)
     logger.info(f"Root: {ISSUER}/")
     logger.info(f"Health: {ISSUER}/health")
     logger.info(f"OAuth callback (demo): {oauth_callback_uri()}")
     logger.info(f"Discovery: {ISSUER}/.well-known/openid-configuration")
+    logger.info(f"OAuth AS metadata: {ISSUER}/.well-known/oauth-authorization-server")
+    if DCR_ENABLED:
+        logger.info(f"Registration (DCR): {ISSUER}/register")
     logger.info(f"Token: {ISSUER}/token")
     logger.info(f"UserInfo: {ISSUER}/userinfo")
     logger.info(f"JWKS: {ISSUER}/.well-known/jwks.json")

@@ -8,20 +8,21 @@ A small, standalone OpenID Connect (OIDC) test provider for local development an
 ## Features
 
 - **Landing & health** — `GET /` serves a small HTML page with links to discovery, authorize, JWKS, OAuth callback demo, and device-flow helpers. **`GET /callback`** receives the authorization redirect (`redirect_uri={issuer}{BASE_PATH}/callback`), shows tokens, UserInfo, and introspection/refresh helpers (see [Landing page demo](#landing-page-demo)). **`GET /health`** returns JSON (`status`, `issuer`, `version`) for Docker/Kubernetes probes.
-- **Discovery** — `GET /.well-known/openid-configuration` (issuer, endpoints, grant types, **`scopes_supported`** and **`claims_supported`** derived from `DEFAULT_CLAIMS_<SCOPE>` configuration, **`introspection_endpoint`**, **`code_challenge_methods_supported`** for PKCE).
+- **Discovery** — `GET /.well-known/openid-configuration` and **`GET /.well-known/oauth-authorization-server`** (RFC 8414; same metadata for MCP/Cursor AS discovery). Includes issuer, endpoints, grant types, **`scopes_supported`** / **`claims_supported`**, **`introspection_endpoint`**, **`registration_endpoint`**, **`token_endpoint_auth_methods_supported`** (including **`none`**), and **`code_challenge_methods_supported`**.
+- **Dynamic Client Registration (RFC 7591)** — `POST /register` for public clients (`token_endpoint_auth_method: "none"`). Cursor can connect with only the issuer URL (no shared `CLIENT_ID` / `CLIENT_SECRET` in `mcp.json`). Default redirect allowlist includes `http://localhost:8787/callback` and `https://www.cursor.com/agents/mcp/oauth/callback`. Public clients **must** use **PKCE S256**.
 - **Signing** — Access and ID tokens are **RS256** JWTs. **`GET /jwks`** exposes the public key with **`x5c`** (self-signed cert by default) so clients that require RS256/x5c can validate remotely.
 - **Authorization code flow** — `GET/POST /authorize` with a browser form to compose **claims** (JSON-backed rows: `sub`, `email`, `groups`, etc.). Redirects with `code`.
-- **PKCE (RFC 7636)** — Optional on the authorization code flow. Pass **`code_challenge`** (and optionally **`code_challenge_method`**) on `/authorize`; if the challenge is present and the method is omitted, **`S256`** is assumed. Discovery advertises **`S256`** and **`plain`**. Exchange the code at **`POST /token`** with **`code_verifier`** (required when a challenge was used).
+- **PKCE (RFC 7636)** — Optional for the static confidential client; **required (S256)** for DCR public clients. Pass **`code_challenge`** (and optionally **`code_challenge_method`**) on `/authorize`; if the challenge is present and the method is omitted, **`S256`** is assumed. Exchange the code at **`POST /token`** with **`code_verifier`**.
 - **Token endpoint** — `POST /token` for:
-  - `grant_type=authorization_code` (with optional PKCE as above); returns **`refresh_token`** for rotating sessions
-  - `grant_type=refresh_token` — exchange a refresh token for new access + ID tokens and a **new** refresh token (rotation)
+  - `grant_type=authorization_code` (with optional/required PKCE as above); returns **`refresh_token`** when **`offline_access`** is in scope (or when no scope was sent, for legacy/demo compatibility)
+  - `grant_type=refresh_token` — exchange a refresh token for new access + ID tokens and a **new** refresh token (rotation); public clients refresh with `client_id` only
   - `grant_type=client_credentials` (no refresh token)
-  - `grant_type=urn:ietf:params:oauth:grant-type:device_code` (**RFC 8628** device flow; includes refresh token)
-- **Token introspection (RFC 7662)** — `POST /introspect` with `token` and client authentication (`client_id` / `client_secret` when strict auth is on). Returns **`active`** (boolean) for access tokens (JWT) and refresh tokens (opaque), plus **`token_type`**, **`client_id`**, **`sub`**, **`exp`**, etc.
+  - `grant_type=urn:ietf:params:oauth:grant-type:device_code` (**RFC 8628** device flow; refresh when `offline_access` is granted)
+- **Token introspection (RFC 7662)** — `POST /introspect` with `token` and client authentication (`client_id` / `client_secret` when strict auth is on; public clients use `client_id` only). Returns **`active`**, **`token_type`**, **`client_id`**, **`sub`**, **`exp`**, **`scope`**, etc.
 - **Device authorization (RFC 8628)** — `POST /device` returns `device_code`, `user_code`, and verification URLs. User completes sign-in at **`GET/POST /device/verify`** (same claims UX as authorize). The client polls **`POST /token`** until approval or expiry.
 - **UserInfo** — `GET /userinfo` with `Authorization: Bearer <access_token>`.
-- **Quick test tokens** — `GET /test-token/{user}?groups=...&client_id=...` for scripted tests.
-- **Tokens** — Issued JWTs include standard claims such as `iss`, `sub`, `aud` (the initiating **client_id**), `exp`, `iat`, plus your configured roles claim (default name **`groups`** via `ROLES_CLAIM`).
+- **Quick test tokens** — `GET /test-token/{user}?groups=...&client_id=...&scope=...` for scripted tests.
+- **Tokens** — Issued JWTs include `iss`, `sub`, `aud`, `exp`, `iat`, **`scope`** (space-separated granted scopes), **`client_id`**, plus your configured roles claim (default name **`groups`** via `ROLES_CLAIM`). By default **`aud`** is the initiating **client_id**; set **`ACCESS_TOKEN_AUDIENCE`** to an API/resource URL when resource servers expect a fixed audience. Add app-specific scopes via `DEFAULT_CLAIMS_<SCOPE>` (empty `{}` for claimless scopes that only appear on the token `scope` claim).
 - **Reverse proxy** — Optional `BASE_PATH` when the app is mounted under a subpath.
 
 ## Status
@@ -57,10 +58,28 @@ python -c "from app import provider; provider.main()"
   curl -s http://localhost:8888/health | jq
   ```
 
-- **Discovery and JWKS:**
+- **Discovery, AS metadata, and JWKS:**
   ```bash
   curl -s http://localhost:8888/.well-known/openid-configuration | jq
-  curl -s http://localhost:8888/jwks | jq
+  curl -s http://localhost:8888/.well-known/oauth-authorization-server | jq
+  curl -s http://localhost:8888/.well-known/jwks.json | jq
+  ```
+
+- **Dynamic Client Registration** (public / PKCE client for Cursor MCP):
+  ```bash
+  curl -s -X POST http://localhost:8888/register \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "client_name": "cursor-mcp",
+      "redirect_uris": [
+        "http://localhost:8787/callback",
+        "https://www.cursor.com/agents/mcp/oauth/callback"
+      ],
+      "token_endpoint_auth_method": "none",
+      "grant_types": ["authorization_code", "refresh_token"],
+      "response_types": ["code"],
+      "scope": "openid offline_access profile"
+    }' | jq
   ```
 
 - **Quick test token** for `bob`:
@@ -185,12 +204,16 @@ Defaults apply when a variable is unset.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ISSUER` | `http://localhost:8888` | Issuer URL (scheme, host, port). Set when behind a proxy or different host. |
-| `CLIENT_ID` | `test-client` | OAuth client id; must match the client when `STRICT_CLIENT_AUTH` is enabled. |
-| `CLIENT_SECRET` | `test-secret` | Client secret for strict auth and confidential flows. |
+| `CLIENT_ID` | `test-client` | Static OAuth client id; must match when `STRICT_CLIENT_AUTH` is enabled. DCR clients get their own `client_id`. |
+| `CLIENT_SECRET` | `test-secret` | Client secret for the static confidential client. |
+| `ACCESS_TOKEN_AUDIENCE` | *(empty → client_id)* | Fixed `aud` claim for access tokens (e.g. API resource URL). When empty, `aud` is the initiating `client_id`. The JWT always also includes a `client_id` claim. |
+| `DCR_ENABLED` | `true` | Advertise `registration_endpoint` and accept `POST /register`. |
+| `DCR_ALLOWED_REDIRECT_URIS` | Cursor callbacks + demo `/callback` | Comma-separated redirect URI allowlist for DCR. Defaults: `http://localhost:8787/callback`, `https://www.cursor.com/agents/mcp/oauth/callback`, plus the demo callback. |
+| `DCR_ALLOW_ANY_REDIRECT` | `false` | If true, accept any `redirect_uris` in registration (still validates them at `/authorize`). |
 | `ROLES_CLAIM` | `groups` | Claim name used for roles/groups in tokens and `/userinfo`. |
-| `DEFAULT_CLAIMS_<SCOPE>` | *(per-scope built-in)* | JSON object of default/example claims for that OAuth scope on `/authorize` and `/device/verify` when no `mock_oidc_userinfo` cookie is set. Claims from multiple requested scopes are merged. Placeholders: `"$uuid"` (fresh UUID), `"$email"` (`givenname-surname@domain`), `"$given_name"`, `"$family_name"`, `"$name"`, `"$preferred_username"` (same random person per form load). Built-in: `openid` → `{"sub":"$uuid"}`, `profile` → name/given_name/family_name/preferred_username placeholders, `email` → `{"email":"$email","email_verified":true}`, plus `ROLES_CLAIM` scope (default `groups`). Custom scopes map to env names by uppercasing (e.g. scope `roles:admin` → `DEFAULT_CLAIMS_ROLES_ADMIN`). |
+| `DEFAULT_CLAIMS_<SCOPE>` | *(per-scope built-in)* | JSON object of default/example claims for that OAuth scope on `/authorize` and `/device/verify` when no `mock_oidc_userinfo` cookie is set. Claims from multiple requested scopes are merged. Placeholders: `"$uuid"` (fresh UUID), `"$email"` (`givenname-surname@domain`), `"$given_name"`, `"$family_name"`, `"$name"`, `"$preferred_username"` (same random person per form load). Built-in: `openid` → `{"sub":"$uuid"}`, `offline_access` → `{}` (claimless; consent for refresh tokens), `profile` → name placeholders, `email` → email placeholders, plus `ROLES_CLAIM` scope (default `groups`). Custom scopes map to env names by uppercasing and replacing non-alnum with `_` (e.g. scope `api:read` → `DEFAULT_CLAIMS_API_READ`; use `{}` for claimless scopes). |
 | `DEFAULT_EMAIL_DOMAIN` | `example.com` | Domain used when expanding `"$email"` / `"$preferred_username"` placeholders. |
-| `STRICT_CLIENT_AUTH` | `true` | If true, `client_id` / `client_secret` must match `CLIENT_ID` / `CLIENT_SECRET` where applicable. Use `false` for permissive local testing. |
+| `STRICT_CLIENT_AUTH` | `true` | If true, confidential clients must present a matching secret. Public DCR clients (`token_endpoint_auth_method=none`) authenticate with `client_id` only (+ PKCE). Use `false` for permissive local testing. |
 | `BASE_PATH` | *(empty)* | **Path** prefix when the app is mounted under a URL path (e.g. `/oidc`), not the hostname. Must not duplicate a path already included in **`ISSUER`**. If you mistakenly set this to your host name (e.g. `oidc.apps.fried-air.com`), it is ignored for generated URLs and a warning is logged. |
 | `OIDC_RSA_PRIVATE_KEY` | *(generate)* | Path to PEM file or PEM string of the RSA **private** key used to sign JWTs. If unset, a key is generated at startup (not stable across restarts). |
 | `OIDC_X509_CERT` | *(self-signed)* | Path to PEM or PEM string of the certificate for **`x5c`** in JWKS. If unset, a self-signed cert is generated with the private key. |

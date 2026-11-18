@@ -24,6 +24,7 @@ def running_server():
     provider.USER_CODE_INDEX.clear()
     provider.REFRESH_TOKENS.clear()
     provider.PAM_SESSIONS.clear()
+    provider.REGISTERED_CLIENTS.clear()
     provider.DEVICE_POLL_INTERVAL = 0  # skip slow_down between polls in tests
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), provider.OIDCHandler)
@@ -87,6 +88,13 @@ def test_claim_keys_normalized_to_lowercase(monkeypatch):
     assert 'Name' not in claims
 
 
+def test_should_issue_refresh_token_offline_access():
+    assert provider.should_issue_refresh_token('') is True
+    assert provider.should_issue_refresh_token('openid') is False
+    assert provider.should_issue_refresh_token('openid offline_access') is True
+    assert provider.should_issue_refresh_token('openid profile offline_access') is True
+
+
 def test_discovery_and_jwks(running_server):
     base = running_server
 
@@ -101,11 +109,21 @@ def test_discovery_and_jwks(running_server):
     assert doc.get('code_challenge_methods_supported') == ['S256', 'plain']
     assert doc.get('introspection_endpoint') == f"{provider.ISSUER}/introspect"
     assert 'refresh_token' in doc.get('grant_types_supported', [])
+    assert doc.get('registration_endpoint') == f"{provider.ISSUER}/register"
+    assert 'none' in doc.get('token_endpoint_auth_methods_supported', [])
     assert doc.get('scopes_supported') == provider.supported_scopes()
     assert doc.get('claims_supported') == provider.supported_claims()
     assert 'openid' in doc.get('scopes_supported', [])
     assert 'offline_access' in doc.get('scopes_supported', [])
     assert 'sub' in doc.get('claims_supported', [])
+
+    # RFC 8414 AS metadata (Cursor/MCP discovery)
+    as_meta = requests.get(f"{base}/.well-known/oauth-authorization-server")
+    assert as_meta.status_code == 200
+    as_doc = as_meta.json()
+    assert as_doc.get('issuer') == provider.ISSUER
+    assert as_doc.get('registration_endpoint') == f"{provider.ISSUER}/register"
+    assert as_doc.get('authorization_endpoint') == doc.get('authorization_endpoint')
 
     # JWKS: RS256 bare key (kty, kid, alg, n, e — no x5c)
     r = requests.get(f"{base}/.well-known/jwks.json")
@@ -246,6 +264,7 @@ def test_pkce_authorization_code_s256(running_server):
             'state': state,
             'code_challenge': code_challenge,
             'code_challenge_method': 'S256',
+            'scope': 'openid profile',
         },
     )
     assert r.status_code == 200
@@ -259,6 +278,7 @@ def test_pkce_authorization_code_s256(running_server):
         'response_type': 'code',
         'code_challenge': code_challenge,
         'code_challenge_method': 'S256',
+        'scope': 'openid profile',
     }
     r = requests.post(f"{base}/authorize", data=data, allow_redirects=False)
     assert r.status_code == 302
@@ -287,12 +307,178 @@ def test_pkce_authorization_code_s256(running_server):
         },
     )
     assert token_resp.status_code == 200
-    access_token = token_resp.json()['access_token']
+    body = token_resp.json()
+    assert 'refresh_token' not in body  # offline_access not requested
+    assert body.get('scope') == 'openid profile'
+    access_token = body['access_token']
     decoded = jwt.decode(
         access_token, provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
         audience=provider.CLIENT_ID,
     )
     assert decoded.get('sub') == 'pkce-user'
+    assert decoded.get('scope') == 'openid profile'
+    assert decoded.get('client_id') == provider.CLIENT_ID
+
+
+def test_dynamic_client_registration_and_pkce_flow(running_server):
+    """RFC 7591 public client → authorize with PKCE S256 → token with scope claim."""
+    base = running_server
+    provider.REGISTERED_CLIENTS.clear()
+
+    reg = requests.post(
+        f"{base}/register",
+        json={
+            'client_name': 'cursor-mcp',
+            'redirect_uris': [
+                'http://localhost:8787/callback',
+                'https://www.cursor.com/agents/mcp/oauth/callback',
+            ],
+            'token_endpoint_auth_method': 'none',
+            'grant_types': ['authorization_code', 'refresh_token'],
+            'response_types': ['code'],
+            'scope': 'openid offline_access profile',
+        },
+    )
+    assert reg.status_code == 201
+    client = reg.json()
+    assert client['token_endpoint_auth_method'] == 'none'
+    assert 'client_secret' not in client
+    client_id = client['client_id']
+    assert client_id in provider.REGISTERED_CLIENTS
+
+    # Reject unknown redirect_uri on registration
+    bad_reg = requests.post(
+        f"{base}/register",
+        json={
+            'redirect_uris': ['https://evil.example/callback'],
+            'token_endpoint_auth_method': 'none',
+        },
+    )
+    assert bad_reg.status_code == 400
+    assert bad_reg.json().get('error') == 'invalid_redirect_uri'
+
+    # Public client without PKCE must fail
+    no_pkce = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': client_id,
+            'redirect_uri': 'http://localhost:8787/callback',
+            'response_type': 'code',
+            'scope': 'openid offline_access',
+        },
+    )
+    assert no_pkce.status_code == 400
+    assert no_pkce.json().get('error') == 'invalid_request'
+
+    redirect_uri = 'http://localhost:8787/callback'
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip('=')
+    scope = 'openid offline_access profile'
+
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'state': 'dcr-state',
+            'code_challenge': code_challenge,
+            'code_challenge_method': 'S256',
+            'scope': scope,
+        },
+    )
+    assert r.status_code == 200
+
+    r = requests.post(
+        f"{base}/authorize",
+        data={
+            'username': 'cursor-user',
+            'roles': 'developer',
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'state': 'dcr-state',
+            'response_type': 'code',
+            'code_challenge': code_challenge,
+            'code_challenge_method': 'S256',
+            'scope': scope,
+        },
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    code = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers['Location']).query)['code'][0]
+
+    tok = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': redirect_uri,
+            'client_id': client_id,
+            'code_verifier': code_verifier,
+        },
+    )
+    assert tok.status_code == 200
+    body = tok.json()
+    assert 'refresh_token' in body
+    assert body.get('scope') == scope
+    decoded = jwt.decode(
+        body['access_token'], provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience=client_id,
+    )
+    assert decoded.get('scope') == scope
+    assert decoded.get('sub') == 'cursor-user'
+    assert decoded.get('aud') == client_id
+    assert decoded.get('client_id') == client_id
+
+    # Refresh without client_secret (public client)
+    refreshed = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'refresh_token',
+            'refresh_token': body['refresh_token'],
+            'client_id': client_id,
+        },
+    )
+    assert refreshed.status_code == 200
+    assert refreshed.json().get('scope') == scope
+    assert 'refresh_token' in refreshed.json()
+
+
+def test_access_token_audience_override(running_server, monkeypatch):
+    base = running_server
+    monkeypatch.setattr(provider, 'ACCESS_TOKEN_AUDIENCE', 'https://api.example/resource')
+
+    redirect_uri = 'https://example.com/callback'
+    r = requests.post(
+        f"{base}/authorize",
+        data={
+            'username': 'aud-user',
+            'roles': 'admin',
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'state': 'aud',
+            'response_type': 'code',
+            'scope': 'openid profile',
+        },
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    code = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers['Location']).query)['code'][0]
+    tok = requests.post(
+        f"{base}/token",
+        data={'grant_type': 'authorization_code', 'code': code, 'redirect_uri': redirect_uri},
+    )
+    assert tok.status_code == 200
+    decoded = jwt.decode(
+        tok.json()['access_token'], provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+        audience='https://api.example/resource',
+    )
+    assert decoded.get('aud') == 'https://api.example/resource'
+    assert decoded.get('client_id') == provider.CLIENT_ID
+    assert decoded.get('scope') == 'openid profile'
+    monkeypatch.setattr(provider, 'ACCESS_TOKEN_AUDIENCE', '')
 
 
 def test_authorization_code_flow_and_userinfo(running_server):
