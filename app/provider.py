@@ -607,8 +607,13 @@ def build_token_response(
     issue_refresh,
     client_ip_log,
     scope: str = '',
+    nonce: str = '',
 ):
-    """Issue access/id token (+ optional refresh). Mutates TOKEN_DATA / REFRESH_TOKENS. Returns JSON dict."""
+    """Issue access/id token (+ optional refresh). Mutates TOKEN_DATA / REFRESH_TOKENS. Returns JSON dict.
+
+    When nonce was supplied on /authorize, it is included as an OIDC ID Token claim
+    (this mock uses the same JWT for access_token and id_token).
+    """
     now_tok = datetime.now(timezone.utc)
     ttl = timedelta(seconds=ACCESS_TOKEN_TTL_SEC)
     audience = resolve_access_token_audience(client_id)
@@ -626,6 +631,9 @@ def build_token_response(
     if scope_str:
         payload["scope"] = scope_str
     payload.update(custom_claims)
+    # Authorize-request nonce wins over any form claim of the same name (OIDC ID Token).
+    if nonce:
+        payload["nonce"] = nonce
 
     token = jwt.encode(
         payload, RSA_PRIVATE_KEY, algorithm="RS256",
@@ -699,11 +707,13 @@ def redeem_authorization_code_for_callback(code: str, redirect_uri: str):
     user_roles = code_data.get('roles', [''])
     client_id = code_data.get('client_id', CLIENT_ID)
     scope = code_data.get('scope', '') or ''
+    nonce = code_data.get('nonce', '') or ''
     issue_refresh = should_issue_refresh_token(scope)
 
     response = build_token_response(
         user_email, client_id, user_roles, custom_claims, issue_refresh, 'oauth-callback',
         scope=scope,
+        nonce=nonce,
     )
     at = response['access_token']
     payload = jwt.decode(at, RSA_PUBLIC_KEY, algorithms=['RS256'], options={'verify_aud': False})
@@ -713,7 +723,7 @@ def redeem_authorization_code_for_callback(code: str, redirect_uri: str):
         ROLES_CLAIM: payload.get(ROLES_CLAIM, []),
     }
     for key, value in payload.items():
-        if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', 'scope', 'client_id', ROLES_CLAIM]:
+        if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', 'scope', 'client_id', 'nonce', ROLES_CLAIM]:
             userinfo[key] = value
     return response, userinfo
 
@@ -910,12 +920,14 @@ class OIDCHandler(BaseHTTPRequestHandler):
         code_challenge = params.get('code_challenge', [''])[0]
         code_challenge_method = params.get('code_challenge_method', [''])[0]
         scope = params.get('scope', [''])[0]
+        nonce = params.get('nonce', [''])[0]
         if code_challenge and not code_challenge_method:
             code_challenge_method = "S256"
 
         logger.info(
             f"Authorization request from {client_ip} - client_id: {client_id}, "
-            f"response_type: {response_type}, scope: {scope or 'openid'}"
+            f"response_type: {response_type}, scope: {scope or 'openid'}, "
+            f"nonce: {'set' if nonce else 'none'}"
         )
 
         if not redirect_uri:
@@ -963,6 +975,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 code_challenge=code_challenge,
                 code_challenge_method=code_challenge_method,
                 scope=scope,
+                nonce=nonce,
                 base_path=BASE_PATH,
                 saved_userinfo=saved_userinfo,
                 default_claims=_configured_default_claims(scope),
@@ -1034,6 +1047,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             code_challenge = post_params.get('code_challenge', [''])[0]
             code_challenge_method = post_params.get('code_challenge_method', [''])[0]
             scope = post_params.get('scope', [''])[0]
+            nonce = post_params.get('nonce', [''])[0]
             if code_challenge and not code_challenge_method:
                 code_challenge_method = "S256"
 
@@ -1066,6 +1080,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 'code_challenge': code_challenge,
                 'code_challenge_method': code_challenge_method,
                 'scope': scope,
+                'nonce': nonce,
                 'username': username,
                 'roles': roles,
                 'custom_claims': custom_claims,
@@ -1582,6 +1597,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
 
         issue_refresh = False
         scope = ''
+        nonce = ''
         client_id = params.get('client_id', [''])[0] or CLIENT_ID
 
         if grant_type == 'authorization_code':
@@ -1662,6 +1678,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             user_roles = code_data.get('roles', [''])
             client_id = code_client
             scope = code_data.get('scope', '') or ''
+            nonce = code_data.get('nonce', '') or ''
             logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles} scope={scope!r}")
             issue_refresh = should_issue_refresh_token(scope)
 
@@ -1834,6 +1851,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
         response = build_token_response(
             user_email, client_id, user_roles, custom_claims, issue_refresh, client_ip,
             scope=scope,
+            nonce=nonce,
         )
 
         self.send_response(200)
@@ -1887,7 +1905,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             }
 
             # Add any custom claims from the token (omit OAuth/JWT housekeeping)
-            _skip = {'iss', 'sub', 'aud', 'exp', 'iat', 'nbf', 'jti', 'email', 'scope', 'client_id', ROLES_CLAIM}
+            _skip = {'iss', 'sub', 'aud', 'exp', 'iat', 'nbf', 'jti', 'email', 'scope', 'client_id', 'nonce', ROLES_CLAIM}
             for key, value in payload.items():
                 if key not in _skip:
                     userinfo[key] = value

@@ -246,6 +246,69 @@ def test_device_verify_uses_scope_from_grant(running_server, monkeypatch):
     assert 'device@example.com' in r.text
 
 
+def test_nonce_returned_in_id_token(running_server):
+    """OIDC: nonce from /authorize must appear on the ID token after code exchange."""
+    base = running_server
+    redirect_uri = 'https://example.com/callback'
+    nonce = 'nonce-abc-123'
+
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'state': 'nonce-state',
+            'scope': 'openid',
+            'nonce': nonce,
+        },
+    )
+    assert r.status_code == 200
+    assert f'name="nonce" value="{nonce}"' in r.text or f"value=\"{nonce}\"" in r.text
+
+    r = requests.post(
+        f"{base}/authorize",
+        data={
+            'username': 'nonce-user',
+            'roles': 'admin',
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'state': 'nonce-state',
+            'response_type': 'code',
+            'scope': 'openid',
+            'nonce': nonce,
+        },
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    code = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers['Location']).query)['code'][0]
+
+    tok = requests.post(
+        f"{base}/token",
+        data={
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': redirect_uri,
+        },
+    )
+    assert tok.status_code == 200
+    body = tok.json()
+    for field in ('id_token', 'access_token'):
+        decoded = jwt.decode(
+            body[field], provider.RSA_PUBLIC_KEY, algorithms=['RS256'],
+            audience=provider.CLIENT_ID,
+        )
+        assert decoded.get('nonce') == nonce, field
+
+    # nonce must not leak into UserInfo
+    ui = requests.get(
+        f"{base}/userinfo",
+        headers={'Authorization': f"Bearer {body['access_token']}"},
+    )
+    assert ui.status_code == 200
+    assert 'nonce' not in ui.json()
+
+
 def test_pkce_authorization_code_s256(running_server):
     base = running_server
     redirect_uri = 'https://example.com/callback'
