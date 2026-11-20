@@ -246,6 +246,70 @@ def test_device_verify_uses_scope_from_grant(running_server, monkeypatch):
     assert 'device@example.com' in r.text
 
 
+def test_parse_authorize_query_preserves_opaque_plus_but_not_scope_spaces():
+    q = provider.parse_authorize_query(
+        'scope=openid+email&state=ab+cd&nonce=x%2By&code_challenge=p+q'
+    )
+    assert q['scope'][0] == 'openid email'
+    assert q['state'][0] == 'ab+cd'
+    assert q['nonce'][0] == 'x+y'
+    assert q['code_challenge'][0] == 'p+q'
+
+
+def test_authorization_redirect_encodes_state():
+    loc = provider.build_authorization_redirect(
+        'http://127.0.0.1:33418/done',
+        code='abc',
+        state='a+b/c=&x',
+    )
+    assert loc.startswith('http://127.0.0.1:33418/done?')
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+    # parse_qs turns bare + into space; our builder must percent-encode so value survives
+    assert q['code'][0] == 'abc'
+    assert q['state'][0] == 'a+b/c=&x'
+    assert '%2B' in loc or '%2b' in loc.lower()
+    assert '%3D' in loc or '%3d' in loc.lower()
+
+
+def test_state_roundtrip_with_special_characters(running_server):
+    """VS Code / OAuth clients often use base64 state with +, /, = — must round-trip exactly."""
+    base = running_server
+    redirect_uri = 'http://127.0.0.1:33418/done'
+    # Simulate a base64-ish state (includes +, /, =)
+    state = 'abc+def/ghi=jkl'
+    # Client may put raw '+' in the query; provider must not turn it into space
+    r = requests.get(
+        f"{base}/authorize",
+        params={
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'state': state,
+            'scope': 'openid',
+        },
+    )
+    assert r.status_code == 200
+
+    r = requests.post(
+        f"{base}/authorize",
+        data={
+            'username': 'state-user',
+            'roles': 'admin',
+            'client_id': provider.CLIENT_ID,
+            'redirect_uri': redirect_uri,
+            'state': state,
+            'response_type': 'code',
+            'scope': 'openid',
+        },
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    loc = r.headers['Location']
+    returned = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)['state'][0]
+    assert returned == state
+    assert urllib.parse.urlparse(loc).path == '/done'
+
+
 def test_nonce_returned_in_id_token(running_server):
     """OIDC: nonce from /authorize must appear on the ID token after code exchange."""
     base = running_server

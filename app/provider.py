@@ -227,6 +227,51 @@ def _parse_scopes(scope: str) -> list[str]:
     return [s for s in (scope or '').split() if s]
 
 
+# Authorize query params that are opaque (often base64) and must not treat '+' as space.
+_OPAQUE_AUTHORIZE_PARAMS = frozenset({
+    'state', 'nonce', 'code_challenge', 'code_verifier',
+})
+
+
+def _query_param_opaque(query: str, name: str) -> str:
+    """Return one query value with percent-decoding only (literal '+' preserved)."""
+    for part in (query or '').split('&'):
+        if not part:
+            continue
+        key, _, val = part.partition('=')
+        if unquote(key) == name:
+            return unquote(val)
+    return ''
+
+
+def parse_authorize_query(query: str) -> dict:
+    """
+    Parse /authorize query params.
+
+    Normal form-decoding for scope/client_id/etc. (so 'openid+email' → 'openid email'),
+    but opaque params (state, nonce, code_challenge) keep literal '+'.
+    """
+    params = parse_qs(query or '', keep_blank_values=True)
+    present = {
+        unquote(part.partition('=')[0])
+        for part in (query or '').split('&') if part
+    }
+    for name in _OPAQUE_AUTHORIZE_PARAMS:
+        if name in present:
+            params[name] = [_query_param_opaque(query, name)]
+    return params
+
+
+def build_authorization_redirect(redirect_uri: str, *, code: str, state: str = '') -> str:
+    """Build the post-login redirect Location with properly encoded code/state."""
+    params = [('code', code)]
+    if state:
+        params.append(('state', state))
+    # Preserve any existing query on redirect_uri (unusual but legal).
+    sep = '&' if urlparse(redirect_uri).query else '?'
+    return f"{redirect_uri}{sep}{urlencode(params)}"
+
+
 def _scope_env_var(scope: str) -> str:
     """Map a scope name to its DEFAULT_CLAIMS_<SCOPE> environment variable."""
     suffix = re.sub(r'[^A-Z0-9]', '_', scope.upper())
@@ -910,7 +955,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
     def handle_authorize(self):
         """Handle authorization request - show login form"""
         parsed_path = urlparse(self.path)
-        params = parse_qs(parsed_path.query)
+        params = parse_authorize_query(parsed_path.query)
         client_ip = self.client_address[0] if self.client_address else 'unknown'
 
         client_id = params.get('client_id', [''])[0]
@@ -1087,10 +1132,11 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 'expires': datetime.now(timezone.utc) + timedelta(minutes=5)
             }
 
-            logger.info(f"Login successful for {username} from {client_ip} - roles: {roles}, redirecting to: {redirect_uri}")
-
-            # Redirect back to the application with the code
-            redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
+            redirect_url = build_authorization_redirect(redirect_uri, code=auth_code, state=state)
+            logger.info(
+                f"Login successful for {username} from {client_ip} - roles: {roles}, "
+                f"redirecting to: {redirect_uri} (state_len={len(state)})"
+            )
 
             # Set cookie with userinfo JSON for SSO-like prefill (encode safely)
             try:
